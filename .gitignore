@@ -35,7 +35,8 @@ tftpboot/images/*.wim
 # Runtime and Local Data
 logs/
 *.log
-data/postgres/
+data/
+*.db
 temp/
 *.tmp
 
