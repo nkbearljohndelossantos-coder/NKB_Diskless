@@ -1,0 +1,653 @@
+package database
+
+import (
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"nkb-diskless/internal/config"
+	"nkb-diskless/internal/models"
+
+	"github.com/google/uuid"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "modernc.org/sqlite"
+)
+
+// DB wraps the standard *sql.DB connection pool with NKB repository operations.
+type DB struct {
+	*sql.DB
+	driver string
+}
+
+// Connect establishes the database connection based on config, falling back to SQLite if PostgreSQL is unreachable.
+func Connect(cfg *config.Config) (*DB, error) {
+	var conn *sql.DB
+	var err error
+	driver := cfg.DBDriver
+
+	if driver == "postgres" {
+		conn, err = sql.Open("pgx", cfg.DBDSN)
+		if err == nil {
+			err = conn.Ping()
+		}
+		if err != nil {
+			slog.Warn("PostgreSQL connection failed; falling back to embedded SQLite database", "err", err)
+			driver = "sqlite"
+		}
+	}
+
+	if driver == "sqlite" {
+		sqlitePath := filepath.Join(cfg.StorageRoot, "data", "nkb_diskless.db")
+		_ = os.MkdirAll(filepath.Dir(sqlitePath), 0755)
+		conn, err = sql.Open("sqlite", sqlitePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+		}
+		// Optimize SQLite concurrency
+		_, _ = conn.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+	}
+
+	conn.SetMaxOpenConns(25)
+	conn.SetMaxIdleConns(10)
+	conn.SetConnMaxLifetime(5 * time.Minute)
+
+	db := &DB{DB: conn, driver: driver}
+	return db, nil
+}
+
+// Helper to parse time values from either postgres native time.Time or sqlite text/integers
+func parseTime(val any) time.Time {
+	if val == nil {
+		return time.Time{}
+	}
+	switch v := val.(type) {
+	case time.Time:
+		return v
+	case string:
+		formats := []string{
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02 15:04:05.999999999-07:00",
+			"2006-01-02 15:04:05-07:00",
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05",
+		}
+		for _, f := range formats {
+			if t, err := time.Parse(f, v); err == nil {
+				return t
+			}
+		}
+	}
+	return time.Time{}
+}
+
+func parseNullTime(val any) *time.Time {
+	if val == nil {
+		return nil
+	}
+	t := parseTime(val)
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+// Migrate executes schema migrations.
+func (db *DB) Migrate(migrationsDir string) error {
+	createMigrationTable := `
+	CREATE TABLE IF NOT EXISTS schema_migrations (
+		version VARCHAR(255) PRIMARY KEY,
+		applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+	);`
+	if _, err := db.Exec(createMigrationTable); err != nil {
+		return fmt.Errorf("failed to create schema_migrations table: %w", err)
+	}
+
+	entries, err := os.ReadDir(migrationsDir)
+	if err != nil {
+		return fmt.Errorf("cannot read migrations directory %s: %w", migrationsDir, err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+
+		migrationName := entry.Name()
+		var count int
+		queryCheck := "SELECT COUNT(*) FROM schema_migrations WHERE version = ?"
+		if db.driver == "postgres" {
+			queryCheck = "SELECT COUNT(*) FROM schema_migrations WHERE version = $1"
+		}
+		_ = db.QueryRow(queryCheck, migrationName).Scan(&count)
+
+		if count > 0 {
+			continue
+		}
+
+		slog.Info("Applying migration", "migration", migrationName)
+		content, err := os.ReadFile(filepath.Join(migrationsDir, migrationName))
+		if err != nil {
+			return fmt.Errorf("failed to read migration %s: %w", migrationName, err)
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+
+		queries := strings.Split(string(content), ";")
+		for _, q := range queries {
+			trimmed := strings.TrimSpace(q)
+			if trimmed == "" {
+				continue
+			}
+			if _, err := tx.Exec(trimmed); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("error executing migration statement in %s: %w\nQuery: %s", migrationName, err, trimmed)
+			}
+		}
+
+		trackQuery := "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
+		if db.driver == "postgres" {
+			trackQuery = "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, $2)"
+		}
+		if _, err := tx.Exec(trackQuery, migrationName, time.Now()); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("failed to record applied migration: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		slog.Info("Successfully applied migration", "migration", migrationName)
+	}
+
+	return nil
+}
+
+func (db *DB) rebind(query string) string {
+	if db.driver != "postgres" {
+		return query
+	}
+	parts := strings.Split(query, "?")
+	if len(parts) == 1 {
+		return query
+	}
+	var b strings.Builder
+	for i := 0; i < len(parts)-1; i++ {
+		b.WriteString(parts[i])
+		fmt.Fprintf(&b, "$%d", i+1)
+	}
+	b.WriteString(parts[len(parts)-1])
+	return b.String()
+}
+
+// ----------------- CLIENTS REPOSITORY -----------------
+
+func (db *DB) ListClients() ([]models.Client, error) {
+	q := `
+	SELECT c.id, c.mac_address, c.ip_address, c.hostname, c.group_id, c.assigned_disk_id,
+	       c.status, c.is_super_client, c.super_client_expires_at, c.boot_mode, c.write_cache_mode,
+	       c.hardware_info, c.last_boot_time, c.last_seen, c.created_at, c.updated_at,
+	       COALESCE(g.name, '') as group_name,
+	       COALESCE(d.name, '') as assigned_disk_name
+	FROM clients c
+	LEFT JOIN client_groups g ON c.group_id = g.id
+	LEFT JOIN virtual_disks d ON c.assigned_disk_id = d.id
+	ORDER BY c.hostname ASC`
+
+	rows, err := db.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var clients []models.Client
+	for rows.Next() {
+		var c models.Client
+		var ip, hw, gid, did sql.NullString
+		var superExpRaw, lastBootRaw, lastSeenRaw, createdRaw, updatedRaw any
+		var grpName, diskName sql.NullString
+
+		err := rows.Scan(
+			&c.ID, &c.MACAddress, &ip, &c.Hostname, &gid, &did,
+			&c.Status, &c.IsSuperClient, &superExpRaw, &c.BootMode, &c.WriteCacheMode,
+			&hw, &lastBootRaw, &lastSeenRaw, &createdRaw, &updatedRaw,
+			&grpName, &diskName,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if ip.Valid { c.IPAddress = ip.String }
+		if hw.Valid { c.HardwareInfo = hw.String }
+		if gid.Valid { c.GroupID = &gid.String }
+		if did.Valid { c.AssignedDiskID = &did.String }
+		c.SuperClientExpireAt = parseNullTime(superExpRaw)
+		c.LastBootTime = parseNullTime(lastBootRaw)
+		c.LastSeen = parseNullTime(lastSeenRaw)
+		c.CreatedAt = parseTime(createdRaw)
+		c.UpdatedAt = parseTime(updatedRaw)
+		if grpName.Valid { c.GroupName = grpName.String }
+		if diskName.Valid { c.AssignedDiskName = diskName.String }
+
+		clients = append(clients, c)
+	}
+
+	return clients, nil
+}
+
+func (db *DB) GetClientByMAC(mac string) (*models.Client, error) {
+	macNorm := strings.ToUpper(strings.ReplaceAll(mac, "-", ":"))
+	q := db.rebind(`
+	SELECT c.id, c.mac_address, c.ip_address, c.hostname, c.group_id, c.assigned_disk_id,
+	       c.status, c.is_super_client, c.super_client_expires_at, c.boot_mode, c.write_cache_mode,
+	       c.hardware_info, c.last_boot_time, c.last_seen, c.created_at, c.updated_at,
+	       COALESCE(g.name, ''), COALESCE(d.name, '')
+	FROM clients c
+	LEFT JOIN client_groups g ON c.group_id = g.id
+	LEFT JOIN virtual_disks d ON c.assigned_disk_id = d.id
+	WHERE UPPER(c.mac_address) = ?`)
+
+	var c models.Client
+	var ip, hw, gid, did sql.NullString
+	var superExpRaw, lastBootRaw, lastSeenRaw, createdRaw, updatedRaw any
+	var grpName, diskName sql.NullString
+
+	err := db.QueryRow(q, macNorm).Scan(
+		&c.ID, &c.MACAddress, &ip, &c.Hostname, &gid, &did,
+		&c.Status, &c.IsSuperClient, &superExpRaw, &c.BootMode, &c.WriteCacheMode,
+		&hw, &lastBootRaw, &lastSeenRaw, &createdRaw, &updatedRaw,
+		&grpName, &diskName,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if ip.Valid { c.IPAddress = ip.String }
+	if hw.Valid { c.HardwareInfo = hw.String }
+	if gid.Valid { c.GroupID = &gid.String }
+	if did.Valid { c.AssignedDiskID = &did.String }
+	c.SuperClientExpireAt = parseNullTime(superExpRaw)
+	c.LastBootTime = parseNullTime(lastBootRaw)
+	c.LastSeen = parseNullTime(lastSeenRaw)
+	c.CreatedAt = parseTime(createdRaw)
+	c.UpdatedAt = parseTime(updatedRaw)
+	if grpName.Valid { c.GroupName = grpName.String }
+	if diskName.Valid { c.AssignedDiskName = diskName.String }
+
+	return &c, nil
+}
+
+func (db *DB) GetClientByID(id string) (*models.Client, error) {
+	q := db.rebind(`
+	SELECT c.id, c.mac_address, c.ip_address, c.hostname, c.group_id, c.assigned_disk_id,
+	       c.status, c.is_super_client, c.super_client_expires_at, c.boot_mode, c.write_cache_mode,
+	       c.hardware_info, c.last_boot_time, c.last_seen, c.created_at, c.updated_at,
+	       COALESCE(g.name, ''), COALESCE(d.name, '')
+	FROM clients c
+	LEFT JOIN client_groups g ON c.group_id = g.id
+	LEFT JOIN virtual_disks d ON c.assigned_disk_id = d.id
+	WHERE c.id = ?`)
+
+	var c models.Client
+	var ip, hw, gid, did sql.NullString
+	var superExpRaw, lastBootRaw, lastSeenRaw, createdRaw, updatedRaw any
+	var grpName, diskName sql.NullString
+
+	err := db.QueryRow(q, id).Scan(
+		&c.ID, &c.MACAddress, &ip, &c.Hostname, &gid, &did,
+		&c.Status, &c.IsSuperClient, &superExpRaw, &c.BootMode, &c.WriteCacheMode,
+		&hw, &lastBootRaw, &lastSeenRaw, &createdRaw, &updatedRaw,
+		&grpName, &diskName,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if ip.Valid { c.IPAddress = ip.String }
+	if hw.Valid { c.HardwareInfo = hw.String }
+	if gid.Valid { c.GroupID = &gid.String }
+	if did.Valid { c.AssignedDiskID = &did.String }
+	c.SuperClientExpireAt = parseNullTime(superExpRaw)
+	c.LastBootTime = parseNullTime(lastBootRaw)
+	c.LastSeen = parseNullTime(lastSeenRaw)
+	c.CreatedAt = parseTime(createdRaw)
+	c.UpdatedAt = parseTime(updatedRaw)
+	if grpName.Valid { c.GroupName = grpName.String }
+	if diskName.Valid { c.AssignedDiskName = diskName.String }
+
+	return &c, nil
+}
+
+func (db *DB) CreateClient(c *models.Client) error {
+	if c.ID == "" {
+		c.ID = uuid.New().String()
+	}
+	c.MACAddress = strings.ToUpper(strings.ReplaceAll(c.MACAddress, "-", ":"))
+	now := time.Now()
+	c.CreatedAt = now
+	c.UpdatedAt = now
+
+	q := db.rebind(`
+	INSERT INTO clients (
+		id, mac_address, ip_address, hostname, group_id, assigned_disk_id,
+		status, is_super_client, boot_mode, write_cache_mode, hardware_info,
+		created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+
+	_, err := db.Exec(q,
+		c.ID, c.MACAddress, c.IPAddress, c.Hostname, c.GroupID, c.AssignedDiskID,
+		c.Status, c.IsSuperClient, c.BootMode, c.WriteCacheMode, c.HardwareInfo,
+		c.CreatedAt.Format(time.RFC3339), c.UpdatedAt.Format(time.RFC3339),
+	)
+	return err
+}
+
+func (db *DB) UpdateClient(c *models.Client) error {
+	c.UpdatedAt = time.Now()
+	c.MACAddress = strings.ToUpper(strings.ReplaceAll(c.MACAddress, "-", ":"))
+
+	q := db.rebind(`
+	UPDATE clients SET
+		mac_address = ?, ip_address = ?, hostname = ?, group_id = ?,
+		assigned_disk_id = ?, status = ?, boot_mode = ?, write_cache_mode = ?,
+		hardware_info = ?, updated_at = ?
+	WHERE id = ?`)
+
+	_, err := db.Exec(q,
+		c.MACAddress, c.IPAddress, c.Hostname, c.GroupID,
+		c.AssignedDiskID, c.Status, c.BootMode, c.WriteCacheMode,
+		c.HardwareInfo, c.UpdatedAt.Format(time.RFC3339), c.ID,
+	)
+	return err
+}
+
+func (db *DB) DeleteClient(id string) error {
+	q := db.rebind(`DELETE FROM clients WHERE id = ?`)
+	_, err := db.Exec(q, id)
+	return err
+}
+
+func (db *DB) SetSuperClient(id string, enable bool, expireMinutes int) error {
+	now := time.Now()
+	var expireAt *string
+	if enable && expireMinutes > 0 {
+		expStr := now.Add(time.Duration(expireMinutes) * time.Minute).Format(time.RFC3339)
+		expireAt = &expStr
+	}
+
+	q := db.rebind(`
+	UPDATE clients SET
+		is_super_client = ?, super_client_expires_at = ?, updated_at = ?
+	WHERE id = ?`)
+
+	_, err := db.Exec(q, enable, expireAt, now.Format(time.RFC3339), id)
+	return err
+}
+
+func (db *DB) RecordHeartbeat(mac string, ip string, hardwareSpecs string) error {
+	now := time.Now()
+	macNorm := strings.ToUpper(strings.ReplaceAll(mac, "-", ":"))
+
+	q := db.rebind(`
+	UPDATE clients SET
+		last_seen = ?, ip_address = COALESCE(NULLIF(?, ''), ip_address),
+		hardware_info = COALESCE(NULLIF(?, ''), hardware_info),
+		status = 'online', updated_at = ?
+	WHERE UPPER(mac_address) = ?`)
+
+	res, err := db.Exec(q, now.Format(time.RFC3339), ip, hardwareSpecs, now.Format(time.RFC3339), macNorm)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		autoClient := &models.Client{
+			ID:             uuid.New().String(),
+			MACAddress:     macNorm,
+			IPAddress:      ip,
+			Hostname:       fmt.Sprintf("NKB-AUTO-%s", strings.ReplaceAll(macNorm, ":", "")[6:]),
+			Status:         "discovered",
+			BootMode:       "UEFI",
+			WriteCacheMode: "volatile",
+			HardwareInfo:   hardwareSpecs,
+		}
+		return db.CreateClient(autoClient)
+	}
+	return nil
+}
+
+// ----------------- VIRTUAL DISKS REPOSITORY -----------------
+
+func (db *DB) ListDisks() ([]models.VirtualDisk, error) {
+	q := `
+	SELECT id, name, description, file_path, size_bytes, disk_format,
+	       is_golden, is_locked, os_type, checksum_sha256, created_at, updated_at
+	FROM virtual_disks ORDER BY name ASC`
+
+	rows, err := db.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var disks []models.VirtualDisk
+	for rows.Next() {
+		var d models.VirtualDisk
+		var desc, chk sql.NullString
+		var createdRaw, updatedRaw any
+		err := rows.Scan(
+			&d.ID, &d.Name, &desc, &d.FilePath, &d.SizeBytes, &d.DiskFormat,
+			&d.IsGolden, &d.IsLocked, &d.OSType, &chk, &createdRaw, &updatedRaw,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if desc.Valid { d.Description = desc.String }
+		if chk.Valid { d.ChecksumSHA256 = chk.String }
+		d.CreatedAt = parseTime(createdRaw)
+		d.UpdatedAt = parseTime(updatedRaw)
+		disks = append(disks, d)
+	}
+	return disks, nil
+}
+
+func (db *DB) GetDiskByID(id string) (*models.VirtualDisk, error) {
+	q := db.rebind(`
+	SELECT id, name, description, file_path, size_bytes, disk_format,
+	       is_golden, is_locked, os_type, checksum_sha256, created_at, updated_at
+	FROM virtual_disks WHERE id = ?`)
+
+	var d models.VirtualDisk
+	var desc, chk sql.NullString
+	var createdRaw, updatedRaw any
+	err := db.QueryRow(q, id).Scan(
+		&d.ID, &d.Name, &desc, &d.FilePath, &d.SizeBytes, &d.DiskFormat,
+		&d.IsGolden, &d.IsLocked, &d.OSType, &chk, &createdRaw, &updatedRaw,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if desc.Valid { d.Description = desc.String }
+	if chk.Valid { d.ChecksumSHA256 = chk.String }
+	d.CreatedAt = parseTime(createdRaw)
+	d.UpdatedAt = parseTime(updatedRaw)
+	return &d, nil
+}
+
+func (db *DB) CreateDisk(d *models.VirtualDisk) error {
+	if d.ID == "" {
+		d.ID = uuid.New().String()
+	}
+	now := time.Now()
+	d.CreatedAt = now
+	d.UpdatedAt = now
+
+	q := db.rebind(`
+	INSERT INTO virtual_disks (
+		id, name, description, file_path, size_bytes, disk_format,
+		is_golden, is_locked, os_type, checksum_sha256, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+
+	_, err := db.Exec(q,
+		d.ID, d.Name, d.Description, d.FilePath, d.SizeBytes, d.DiskFormat,
+		d.IsGolden, d.IsLocked, d.OSType, d.ChecksumSHA256,
+		d.CreatedAt.Format(time.RFC3339), d.UpdatedAt.Format(time.RFC3339),
+	)
+	return err
+}
+
+func (db *DB) UpdateDisk(d *models.VirtualDisk) error {
+	d.UpdatedAt = time.Now()
+	q := db.rebind(`
+	UPDATE virtual_disks SET
+		name = ?, description = ?, file_path = ?, size_bytes = ?,
+		disk_format = ?, is_golden = ?, is_locked = ?, os_type = ?,
+		checksum_sha256 = ?, updated_at = ?
+	WHERE id = ?`)
+
+	_, err := db.Exec(q,
+		d.Name, d.Description, d.FilePath, d.SizeBytes,
+		d.DiskFormat, d.IsGolden, d.IsLocked, d.OSType,
+		d.ChecksumSHA256, d.UpdatedAt.Format(time.RFC3339), d.ID,
+	)
+	return err
+}
+
+func (db *DB) DeleteDisk(id string) error {
+	var isLocked bool
+	_ = db.QueryRow(db.rebind("SELECT is_locked FROM virtual_disks WHERE id = ?"), id).Scan(&isLocked)
+	if isLocked {
+		return fmt.Errorf("cannot delete disk %s: disk is marked as locked/protected", id)
+	}
+
+	q := db.rebind(`DELETE FROM virtual_disks WHERE id = ?`)
+	_, err := db.Exec(q, id)
+	return err
+}
+
+// ----------------- CLIENT GROUPS REPOSITORY -----------------
+
+func (db *DB) ListGroups() ([]models.ClientGroup, error) {
+	q := `
+	SELECT g.id, g.name, g.description, g.default_disk_id, g.boot_timeout_seconds,
+	       g.write_cache_policy, g.allow_super_client, g.created_at, g.updated_at,
+	       COUNT(c.id) as client_count
+	FROM client_groups g
+	LEFT JOIN clients c ON c.group_id = g.id
+	GROUP BY g.id, g.name, g.description, g.default_disk_id, g.boot_timeout_seconds,
+	         g.write_cache_policy, g.allow_super_client, g.created_at, g.updated_at
+	ORDER BY g.name ASC`
+
+	rows, err := db.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []models.ClientGroup
+	for rows.Next() {
+		var g models.ClientGroup
+		var desc, defDisk sql.NullString
+		var createdRaw, updatedRaw any
+		err := rows.Scan(
+			&g.ID, &g.Name, &desc, &defDisk, &g.BootTimeoutSeconds,
+			&g.WriteCachePolicy, &g.AllowSuperClient, &createdRaw, &updatedRaw,
+			&g.ClientCount,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if desc.Valid { g.Description = desc.String }
+		if defDisk.Valid { g.DefaultDiskID = &defDisk.String }
+		g.CreatedAt = parseTime(createdRaw)
+		g.UpdatedAt = parseTime(updatedRaw)
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
+func (db *DB) CreateGroup(g *models.ClientGroup) error {
+	if g.ID == "" {
+		g.ID = uuid.New().String()
+	}
+	now := time.Now()
+	g.CreatedAt = now
+	g.UpdatedAt = now
+
+	q := db.rebind(`
+	INSERT INTO client_groups (
+		id, name, description, default_disk_id, boot_timeout_seconds,
+		write_cache_policy, allow_super_client, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+
+	_, err := db.Exec(q,
+		g.ID, g.Name, g.Description, g.DefaultDiskID, g.BootTimeoutSeconds,
+		g.WriteCachePolicy, g.AllowSuperClient,
+		g.CreatedAt.Format(time.RFC3339), g.UpdatedAt.Format(time.RFC3339),
+	)
+	return err
+}
+
+// ----------------- AUDIT LOGS REPOSITORY -----------------
+
+func (db *DB) RecordAudit(userID *string, username string, action string, targetType string, targetID string, details string, ip string) error {
+	id := uuid.New().String()
+	now := time.Now()
+	q := db.rebind(`
+	INSERT INTO audit_logs (id, user_id, username, action, target_type, target_id, details, ip_address, created_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+
+	_, err := db.Exec(q, id, userID, username, action, targetType, targetID, details, ip, now.Format(time.RFC3339))
+	return err
+}
+
+func (db *DB) ListAuditLogs(limit int) ([]models.AuditLog, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	q := db.rebind(`
+	SELECT id, user_id, username, action, target_type, target_id, details, ip_address, created_at
+	FROM audit_logs ORDER BY created_at DESC LIMIT ?`)
+
+	rows, err := db.Query(q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var logs []models.AuditLog
+	for rows.Next() {
+		var l models.AuditLog
+		var uid, user, det, ip sql.NullString
+		var createdRaw any
+		err := rows.Scan(
+			&l.ID, &uid, &user, &l.Action, &l.TargetType, &l.TargetID, &det, &ip, &createdRaw,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if uid.Valid { l.UserID = &uid.String }
+		if user.Valid { l.Username = user.String }
+		if det.Valid { l.Details = det.String }
+		if ip.Valid { l.IPAddress = ip.String }
+		l.CreatedAt = parseTime(createdRaw)
+		logs = append(logs, l)
+	}
+	return logs, nil
+}
