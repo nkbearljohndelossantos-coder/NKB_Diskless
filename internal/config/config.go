@@ -19,12 +19,22 @@ type Config struct {
 	EnableProxyDHCP bool   `json:"enable_proxy_dhcp"`
 	EnableTFTP     bool   `json:"enable_tftp"`
 
-	// Storage and image repositories
-	StorageRoot    string `json:"storage_root"`
-	DisksDir       string `json:"disks_dir"`
-	CacheDir       string `json:"cache_dir"`
-	SnapshotsDir   string `json:"snapshots_dir"`
-	TFTPBootDir    string `json:"tftpboot_dir"`
+	// Storage and image repositories (Default: C:\NKB-PoC)
+	StorageRoot     string `json:"storage_root"`
+	AppDir          string `json:"app_dir"`
+	DatabaseDir     string `json:"database_dir"`
+	LogsDir         string `json:"logs_dir"`
+	BackupsDir      string `json:"backups_dir"`
+	DisksDir        string `json:"disks_dir"`
+	DisksVirtualDir string `json:"disks_virtual_dir"`
+	DisksGoldenDir  string `json:"disks_golden_dir"`
+	DisksClientsDir string `json:"disks_clients_dir"`
+	DisksStagingDir string `json:"disks_staging_dir"`
+	CacheDir        string `json:"cache_dir"`
+	SnapshotsDir    string `json:"snapshots_dir"`
+	BootDir         string `json:"boot_dir"`
+	ConfigDir       string `json:"config_dir"`
+	TFTPBootDir     string `json:"tftpboot_dir"`
 
 	// Database
 	DBDriver string `json:"db_driver"` // "postgres" or "sqlite3"
@@ -46,10 +56,25 @@ type Config struct {
 
 // DefaultConfig returns safe production-ready defaults.
 func DefaultConfig(baseDir string) *Config {
+	if baseDir == "" {
+		baseDir = `C:\NKB-PoC`
+	}
+
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "nkb-master-server"
 	}
+
+	appDir := filepath.Join(baseDir, "app")
+	dbDir := filepath.Join(baseDir, "database")
+	logsDir := filepath.Join(baseDir, "logs")
+	backupsDir := filepath.Join(baseDir, "backups")
+	disksVirtualDir := filepath.Join(baseDir, "disks", "virtual")
+	disksGoldenDir := filepath.Join(baseDir, "disks", "golden")
+	disksClientsDir := filepath.Join(baseDir, "disks", "clients")
+	disksStagingDir := filepath.Join(baseDir, "disks", "staging")
+	bootDir := filepath.Join(baseDir, "boot")
+	configDir := filepath.Join(baseDir, "config")
 
 	return &Config{
 		ServerID:        "nkb-srv-primary-01",
@@ -62,25 +87,60 @@ func DefaultConfig(baseDir string) *Config {
 		EnableProxyDHCP: true,
 		EnableTFTP:      true,
 
-		StorageRoot:  baseDir,
-		DisksDir:     filepath.Join(baseDir, "disks"),
-		CacheDir:     filepath.Join(baseDir, "cache"),
-		SnapshotsDir: filepath.Join(baseDir, "snapshots"),
-		TFTPBootDir:  filepath.Join(baseDir, "tftpboot"),
+		StorageRoot:     baseDir,
+		AppDir:          appDir,
+		DatabaseDir:     dbDir,
+		LogsDir:         logsDir,
+		BackupsDir:      backupsDir,
+		DisksDir:        disksVirtualDir,
+		DisksVirtualDir: disksVirtualDir,
+		DisksGoldenDir:  disksGoldenDir,
+		DisksClientsDir: disksClientsDir,
+		DisksStagingDir: disksStagingDir,
+		CacheDir:        disksClientsDir,
+		SnapshotsDir:    disksStagingDir,
+		BootDir:         bootDir,
+		ConfigDir:       configDir,
+		TFTPBootDir:     bootDir,
 
-		DBDriver: "postgres",
-		DBDSN:    "postgres://postgres:nkbdiskless@localhost:5432/nkb_diskless?sslmode=disable",
+		DBDriver: "sqlite",
+		DBDSN:    "",
 
 		JWTSecret:       "nkb-enterprise-diskless-secret-key-change-in-production",
 		TokenExpiration: 24,
 
-		ISCSIIQNPfx: "iqn.2026-11.com.nkb",
+		ISCSIIQNPfx: "iqn.2026-03.com.nkb",
 		ISCSIPortal: "0.0.0.0",
 		ISCSIPort:   3260,
 		EnableCHAP:  false,
 
 		Environment: "development",
 	}
+}
+
+// EnsureStorageLayout creates the directory hierarchy according to NKB data protection standards.
+func (cfg *Config) EnsureStorageLayout() error {
+	dirs := []string{
+		cfg.StorageRoot,
+		cfg.AppDir,
+		cfg.DatabaseDir,
+		cfg.LogsDir,
+		cfg.BackupsDir,
+		cfg.DisksVirtualDir,
+		cfg.DisksGoldenDir,
+		cfg.DisksClientsDir,
+		cfg.DisksStagingDir,
+		cfg.BootDir,
+		cfg.ConfigDir,
+	}
+	for _, d := range dirs {
+		if d != "" {
+			if err := os.MkdirAll(d, 0755); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // LoadConfig reads config from a JSON file, or falls back to defaults and saves.

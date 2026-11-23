@@ -27,7 +27,7 @@ import (
 func main() {
 	configPath := flag.String("config", "nkb_config.json", "Path to NKB configuration file")
 	apiPort := flag.Int("port", 8443, "Management API & Dashboard HTTP port")
-	baseDir := flag.String("data", ".", "Base directory for disks, caches, and database")
+	baseDir := flag.String("data", `C:\NKB-PoC`, "Base directory for NKB POC storage (Default: C:\\NKB-PoC)")
 	flag.Parse()
 
 	// Configure structured JSON logging
@@ -50,6 +50,13 @@ func main() {
 	if *apiPort != 8443 {
 		cfg.APIPort = *apiPort
 	}
+
+	// Ensure structured storage hierarchy exists safely
+	if err := cfg.EnsureStorageLayout(); err != nil {
+		slog.Error("Failed to initialize storage layout", "root", cfg.StorageRoot, "err", err)
+		os.Exit(1)
+	}
+	slog.Info("Initialized NKB Storage Layout", "root", cfg.StorageRoot)
 
 	// 1. Connect to Database (PostgreSQL or local SQLite fallback)
 	db, err := database.Connect(cfg)

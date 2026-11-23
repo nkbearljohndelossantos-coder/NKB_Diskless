@@ -65,7 +65,10 @@ func (u *UpdateManager) CreatePreUpdateBackup(versionTag string) (string, error)
 
 	// In SQLite mode, copy SQLite file safely
 	if u.cfg.DBDriver == "sqlite" {
-		sqliteSrc := filepath.Join(u.cfg.StorageRoot, "data", "nkb_diskless.db")
+		sqliteSrc := filepath.Join(u.cfg.DatabaseDir, "nkb_diskless.db")
+		if _, err := os.Stat(sqliteSrc); os.IsNotExist(err) {
+			sqliteSrc = filepath.Join(u.cfg.StorageRoot, "data", "nkb_diskless.db")
+		}
 		src, err := os.Open(sqliteSrc)
 		if err != nil {
 			return "", fmt.Errorf("cannot read database for backup: %w", err)
@@ -174,7 +177,10 @@ func (u *UpdateManager) Rollback(backupPath string) error {
 	}
 
 	if u.cfg.DBDriver == "sqlite" {
-		sqliteDst := filepath.Join(u.cfg.StorageRoot, "data", "nkb_diskless.db")
+		sqliteDst := filepath.Join(u.cfg.DatabaseDir, "nkb_diskless.db")
+		if u.cfg.DatabaseDir == "" {
+			sqliteDst = filepath.Join(u.cfg.StorageRoot, "data", "nkb_diskless.db")
+		}
 		// Safely restore
 		src, err := os.Open(backupPath)
 		if err != nil {

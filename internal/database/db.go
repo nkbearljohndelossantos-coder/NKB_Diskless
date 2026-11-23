@@ -43,8 +43,12 @@ func Connect(cfg *config.Config) (*DB, error) {
 	}
 
 	if driver == "sqlite" {
-		sqlitePath := filepath.Join(cfg.StorageRoot, "data", "nkb_diskless.db")
-		_ = os.MkdirAll(filepath.Dir(sqlitePath), 0755)
+		dbDir := cfg.DatabaseDir
+		if dbDir == "" {
+			dbDir = filepath.Join(cfg.StorageRoot, "database")
+		}
+		_ = os.MkdirAll(dbDir, 0755)
+		sqlitePath := filepath.Join(dbDir, "nkb_diskless.db")
 		conn, err = sql.Open("sqlite", sqlitePath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open sqlite database: %w", err)
