@@ -1,0 +1,16 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "nkb-desktop-manager",
+  "outputfilename": "nkb-desktop-manager.exe",
+  "frontend:dir": "dist",
+  "author": {
+    "name": "NKB Manufacturing",
+    "email": "systems@nkb-manufacturing.local"
+  },
+  "info": {
+    "companyName": "NKB Manufacturing",
+    "productName": "NKB Diskless System Desktop Manager",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright 2026 NKB Manufacturing"
+  }
+}

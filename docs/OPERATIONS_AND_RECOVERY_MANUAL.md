@@ -134,3 +134,56 @@ If a physical hardware failure or database corruption occurs:
 - **Remedy:**
   1. Run the image preparation script: `.\scripts\prepare-golden-image.ps1 -DriverDir "C:\Drivers\Realtek"`.
   2. Ensure registry key `HKLM\SYSTEM\CurrentControlSet\Services\msiscsi\Start` is set to `0` (Boot).
+  3. Apply the NDIS link reset mitigation patch from the NKB Dashboard under iSCSI Manager.
+
+---
+
+## 7. ISOLATED TESTING VLAN 99 & SWITCH RUNBOOK
+
+To safely test network boot without modifying or risking production corporate DHCP:
+
+### 7.1 Managed Switch Port Configuration (Cisco / EdgeSwitch / UniFi)
+```text
+! Cisco IOS Isolated VLAN Configuration
+vlan 99
+ name NKB-Diskless-Test-VLAN
+exit
+
+! Server Interface (Port 1)
+interface GigabitEthernet0/1
+ description NKB-Server-Primary
+ switchport mode access
+ switchport access vlan 99
+ spanning-tree portfast
+ no shutdown
+exit
+
+! Test Client Workstation (Port 2)
+interface GigabitEthernet0/2
+ description NKB-Test-Client-01
+ switchport mode access
+ switchport access vlan 99
+ spanning-tree portfast
+ no shutdown
+exit
+```
+
+### 7.2 Point-to-Point Direct Ethernet Cable (Zero Switch Setup)
+If an isolated managed switch is not immediately available:
+1. Connect a standard Cat5e/Cat6 patch cable directly between the server's second NIC and the test client's NIC.
+2. Assign static IP `192.168.99.1/24` to the server NIC.
+3. Start `nkb-server.exe` with ProxyDHCP enabled.
+4. Power on the client workstation with UEFI network boot enabled.
+
+---
+
+## 8. BINARY DEPLOYMENT & COMMAND QUICK REFERENCE
+
+All three compiled binaries are located in the `bin/` directory:
+
+| Binary | Role | Usage Command |
+| :--- | :--- | :--- |
+| `bin\nkb-server.exe` | Core API, PXE, TFTP, SPA | `.\bin\nkb-server.exe -port 8080 -storage storage` |
+| `bin\nkb-agent.exe` | Workstation Service | `.\bin\nkb-agent.exe -debug` (Interactive) or `.\bin\nkb-agent.exe -service install` |
+| `bin\nkb-desktop-manager.exe` | Wails Desktop GUI | `.\bin\nkb-desktop-manager.exe` |
+
