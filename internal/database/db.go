@@ -990,3 +990,283 @@ func (db *DB) ListAuditLogs(limit int) ([]models.AuditLog, error) {
 	}
 	return logs, nil
 }
+
+// ----------------- DISK VERSIONS, ASSIGNMENTS & MAINTENANCE LOCKS -----------------
+
+func (db *DB) CreateDiskVersion(v *models.DiskVersion) error {
+	if v.ID == "" {
+		v.ID = uuid.New().String()
+	}
+	if v.CreatedAt.IsZero() {
+		v.CreatedAt = time.Now()
+	}
+
+	q := db.rebind(`
+	INSERT INTO disk_versions (
+		id, disk_id, version_number, version_tag, snapshot_path, description,
+		checksum_sha256, created_by, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+
+	_, err := db.Exec(q,
+		v.ID, v.DiskID, v.VersionNumber, v.VersionTag, v.SnapshotPath, v.Description,
+		v.ChecksumSHA256, v.CreatedBy, v.CreatedAt.Format(time.RFC3339),
+	)
+	return err
+}
+
+func (db *DB) ListDiskVersions(diskID string) ([]models.DiskVersion, error) {
+	q := db.rebind(`
+	SELECT id, disk_id, version_number, version_tag, snapshot_path, description,
+	       checksum_sha256, created_by, created_at
+	FROM disk_versions WHERE disk_id = ? ORDER BY version_number DESC`)
+
+	rows, err := db.Query(q, diskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var versions []models.DiskVersion
+	for rows.Next() {
+		var v models.DiskVersion
+		var desc, chk, createdBy sql.NullString
+		var createdRaw any
+		err := rows.Scan(
+			&v.ID, &v.DiskID, &v.VersionNumber, &v.VersionTag, &v.SnapshotPath,
+			&desc, &chk, &createdBy, &createdRaw,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if desc.Valid { v.Description = desc.String }
+		if chk.Valid { v.ChecksumSHA256 = chk.String }
+		if createdBy.Valid { v.CreatedBy = &createdBy.String }
+		v.CreatedAt = parseTime(createdRaw)
+		versions = append(versions, v)
+	}
+	return versions, nil
+}
+
+func (db *DB) GetDiskVersionByID(id string) (*models.DiskVersion, error) {
+	q := db.rebind(`
+	SELECT id, disk_id, version_number, version_tag, snapshot_path, description,
+	       checksum_sha256, created_by, created_at
+	FROM disk_versions WHERE id = ?`)
+
+	var v models.DiskVersion
+	var desc, chk, createdBy sql.NullString
+	var createdRaw any
+	err := db.QueryRow(q, id).Scan(
+		&v.ID, &v.DiskID, &v.VersionNumber, &v.VersionTag, &v.SnapshotPath,
+		&desc, &chk, &createdBy, &createdRaw,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if desc.Valid { v.Description = desc.String }
+	if chk.Valid { v.ChecksumSHA256 = chk.String }
+	if createdBy.Valid { v.CreatedBy = &createdBy.String }
+	v.CreatedAt = parseTime(createdRaw)
+	return &v, nil
+}
+
+func (db *DB) GetLatestDiskVersion(diskID string) (*models.DiskVersion, error) {
+	q := db.rebind(`
+	SELECT id, disk_id, version_number, version_tag, snapshot_path, description,
+	       checksum_sha256, created_by, created_at
+	FROM disk_versions WHERE disk_id = ? ORDER BY version_number DESC LIMIT 1`)
+
+	var v models.DiskVersion
+	var desc, chk, createdBy sql.NullString
+	var createdRaw any
+	err := db.QueryRow(q, diskID).Scan(
+		&v.ID, &v.DiskID, &v.VersionNumber, &v.VersionTag, &v.SnapshotPath,
+		&desc, &chk, &createdBy, &createdRaw,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if desc.Valid { v.Description = desc.String }
+	if chk.Valid { v.ChecksumSHA256 = chk.String }
+	if createdBy.Valid { v.CreatedBy = &createdBy.String }
+	v.CreatedAt = parseTime(createdRaw)
+	return &v, nil
+}
+
+func (db *DB) CreateDiskAssignment(a *models.DiskAssignment) error {
+	if a.ID == "" {
+		a.ID = uuid.New().String()
+	}
+	if a.AssignedAt.IsZero() {
+		a.AssignedAt = time.Now()
+	}
+
+	// Deactivate any existing active assignment for this client
+	deactQ := db.rebind(`UPDATE disk_assignments SET is_active = FALSE WHERE client_id = ?`)
+	_, _ = db.Exec(deactQ, a.ClientID)
+
+	q := db.rebind(`
+	INSERT INTO disk_assignments (
+		id, client_id, disk_id, deployment_type, mount_point, is_active, assigned_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+
+	_, err := db.Exec(q,
+		a.ID, a.ClientID, a.DiskID, a.DeploymentType, a.MountPoint, a.IsActive,
+		a.AssignedAt.Format(time.RFC3339),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Update clients table assigned_disk_id
+	updQ := db.rebind(`UPDATE clients SET assigned_disk_id = ?, updated_at = ? WHERE id = ?`)
+	_, _ = db.Exec(updQ, a.DiskID, time.Now().Format(time.RFC3339), a.ClientID)
+
+	return nil
+}
+
+func (db *DB) GetDiskAssignment(clientID string) (*models.DiskAssignment, error) {
+	q := db.rebind(`
+	SELECT id, client_id, disk_id, deployment_type, mount_point, is_active, assigned_at
+	FROM disk_assignments WHERE client_id = ? AND is_active = TRUE LIMIT 1`)
+
+	var a models.DiskAssignment
+	var mp sql.NullString
+	var assignedRaw any
+	err := db.QueryRow(q, clientID).Scan(
+		&a.ID, &a.ClientID, &a.DiskID, &a.DeploymentType, &mp, &a.IsActive, &assignedRaw,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if mp.Valid { a.MountPoint = mp.String }
+	a.AssignedAt = parseTime(assignedRaw)
+	return &a, nil
+}
+
+func (db *DB) ListDiskAssignments() ([]models.DiskAssignment, error) {
+	q := `
+	SELECT id, client_id, disk_id, deployment_type, mount_point, is_active, assigned_at
+	FROM disk_assignments WHERE is_active = TRUE ORDER BY assigned_at DESC`
+
+	rows, err := db.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []models.DiskAssignment
+	for rows.Next() {
+		var a models.DiskAssignment
+		var mp sql.NullString
+		var assignedRaw any
+		err := rows.Scan(
+			&a.ID, &a.ClientID, &a.DiskID, &a.DeploymentType, &mp, &a.IsActive, &assignedRaw,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if mp.Valid { a.MountPoint = mp.String }
+		a.AssignedAt = parseTime(assignedRaw)
+		list = append(list, a)
+	}
+	return list, nil
+}
+
+func (db *DB) DeactivateDiskAssignment(clientID string) error {
+	q := db.rebind(`UPDATE disk_assignments SET is_active = FALSE WHERE client_id = ?`)
+	_, err := db.Exec(q, clientID)
+	if err != nil {
+		return err
+	}
+	updQ := db.rebind(`UPDATE clients SET assigned_disk_id = NULL, updated_at = ? WHERE id = ?`)
+	_, _ = db.Exec(updQ, time.Now().Format(time.RFC3339), clientID)
+	return nil
+}
+
+func (db *DB) AcquireMaintenanceLock(lock *models.MaintenanceLock) error {
+	if lock.ID == "" {
+		lock.ID = uuid.New().String()
+	}
+	if lock.AcquiredAt.IsZero() {
+		lock.AcquiredAt = time.Now()
+	}
+
+	// First verify that no active lock exists for this disk that hasn't expired
+	activeLock, err := db.GetActiveMaintenanceLock(lock.DiskID)
+	if err != nil {
+		return err
+	}
+	if activeLock != nil && activeLock.ExpiresAt.After(time.Now()) {
+		return fmt.Errorf("disk is locked by workstation %s until %s",
+			activeLock.ClientID, activeLock.ExpiresAt.Format(time.RFC3339))
+	}
+
+	// Deactivate any stale lock
+	staleQ := db.rebind(`UPDATE maintenance_locks SET is_active = FALSE WHERE disk_id = ? AND is_active = TRUE`)
+	_, _ = db.Exec(staleQ, lock.DiskID)
+
+	q := db.rebind(`
+	INSERT INTO maintenance_locks (
+		id, disk_id, client_id, acquired_by, session_token, is_active,
+		acquired_at, expires_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+
+	_, err = db.Exec(q,
+		lock.ID, lock.DiskID, lock.ClientID, lock.AcquiredBy, lock.SessionToken,
+		lock.IsActive, lock.AcquiredAt.Format(time.RFC3339), lock.ExpiresAt.Format(time.RFC3339),
+	)
+	return err
+}
+
+func (db *DB) GetActiveMaintenanceLock(diskID string) (*models.MaintenanceLock, error) {
+	q := db.rebind(`
+	SELECT id, disk_id, client_id, acquired_by, session_token, is_active,
+	       acquired_at, expires_at, released_at
+	FROM maintenance_locks
+	WHERE disk_id = ? AND is_active = TRUE
+	ORDER BY acquired_at DESC LIMIT 1`)
+
+	var l models.MaintenanceLock
+	var acqRaw, expRaw, relRaw any
+	err := db.QueryRow(q, diskID).Scan(
+		&l.ID, &l.DiskID, &l.ClientID, &l.AcquiredBy, &l.SessionToken, &l.IsActive,
+		&acqRaw, &expRaw, &relRaw,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	l.AcquiredAt = parseTime(acqRaw)
+	l.ExpiresAt = parseTime(expRaw)
+	l.ReleasedAt = parseNullTime(relRaw)
+
+	// If expired, automatically mark inactive
+	if l.ExpiresAt.Before(time.Now()) {
+		_ = db.ReleaseMaintenanceLock(diskID, l.ClientID)
+		return nil, nil
+	}
+
+	return &l, nil
+}
+
+func (db *DB) ReleaseMaintenanceLock(diskID string, clientID string) error {
+	now := time.Now()
+	q := db.rebind(`
+	UPDATE maintenance_locks
+	SET is_active = FALSE, released_at = ?
+	WHERE disk_id = ? AND (client_id = ? OR ? = '') AND is_active = TRUE`)
+	_, err := db.Exec(q, now.Format(time.RFC3339), diskID, clientID, clientID)
+	return err
+}

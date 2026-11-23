@@ -12,6 +12,7 @@ import (
 	"nkb-diskless/internal/database"
 	"nkb-diskless/internal/models"
 	"nkb-diskless/internal/services/auth_rbac"
+	"nkb-diskless/internal/services/client_mgmt"
 	"nkb-diskless/internal/services/image_mgmt"
 	"nkb-diskless/internal/services/monitoring"
 	"nkb-diskless/internal/services/pxe_boot"
@@ -89,14 +90,22 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/clients/{id}/reboot", s.handleRebootClient)
 	s.mux.HandleFunc("POST /api/v1/workstations/{id}/command", s.handleQueueCommand)
 	s.mux.HandleFunc("GET /api/v1/workstations/{id}/commands", s.handleListCommands)
+	s.mux.HandleFunc("POST /api/v1/workstations/{id}/wol", s.handleWakeOnLAN)
+	s.mux.HandleFunc("GET /api/v1/workstations/{id}/rdp", s.handleDownloadRDP)
 
-	// 5. Virtual Disk Management
+	// 5. Virtual Disk & Golden Image Management
 	s.mux.HandleFunc("GET /api/v1/disks", s.handleListDisks)
 	s.mux.HandleFunc("POST /api/v1/disks", s.handleCreateDisk)
 	s.mux.HandleFunc("GET /api/v1/disks/{id}", s.handleGetDisk)
 	s.mux.HandleFunc("PUT /api/v1/disks/{id}", s.handleUpdateDisk)
 	s.mux.HandleFunc("DELETE /api/v1/disks/{id}", s.handleDeleteDisk)
 	s.mux.HandleFunc("POST /api/v1/disks/{id}/duplicate", s.handleDuplicateDisk)
+	s.mux.HandleFunc("POST /api/v1/disks/{id}/assign", s.handleAssignDisk)
+	s.mux.HandleFunc("POST /api/v1/workstations/{id}/unassign-disk", s.handleUnassignDisk)
+	s.mux.HandleFunc("GET /api/v1/disks/{id}/versions", s.handleListDiskVersions)
+	s.mux.HandleFunc("POST /api/v1/disks/{id}/rollback", s.handleRollbackDisk)
+	s.mux.HandleFunc("POST /api/v1/disks/{id}/validate", s.handleValidateDisk)
+	s.mux.HandleFunc("POST /api/v1/super-client/commit", s.handleCommitSuperClient)
 
 	// 6. Client Groups
 	s.mux.HandleFunc("GET /api/v1/groups", s.handleListGroups)
@@ -315,6 +324,41 @@ func (s *Server) handleListCommands(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, http.StatusOK, cmds)
 }
 
+func (s *Server) handleWakeOnLAN(w http.ResponseWriter, r *http.Request) {
+	clientID := r.PathValue("id")
+	client, err := s.db.GetClientByID(clientID)
+	if err != nil || client == nil {
+		s.errorResponse(w, http.StatusNotFound, "workstation not found")
+		return
+	}
+
+	if err := client_mgmt.SendWakeOnLAN(client.MACAddress, ""); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("failed to send WOL packet: %v", err))
+		return
+	}
+
+	_ = s.db.RecordAudit(nil, "admin", "WOL_SENT", "client", clientID, fmt.Sprintf("Wake-on-LAN magic packet sent to %s (%s)", client.Hostname, client.MACAddress), r.RemoteAddr)
+	s.jsonResponse(w, http.StatusOK, map[string]string{
+		"status":  "magic_packet_broadcast",
+		"target":  client.MACAddress,
+		"message": fmt.Sprintf("Wake-on-LAN packet dispatched to %s", client.Hostname),
+	})
+}
+
+func (s *Server) handleDownloadRDP(w http.ResponseWriter, r *http.Request) {
+	clientID := r.PathValue("id")
+	client, err := s.db.GetClientByID(clientID)
+	if err != nil || client == nil {
+		s.errorResponse(w, http.StatusNotFound, "workstation not found")
+		return
+	}
+
+	rdpContent := client_mgmt.GenerateRDPFile(client.Hostname, client.IPAddress)
+	w.Header().Set("Content-Type", "application/x-rdp")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s.rdp", client.Hostname))
+	_, _ = w.Write([]byte(rdpContent))
+}
+
 // ----------------- CLIENT / SYSTEM ROUTE HANDLERS -----------------
 
 func (s *Server) handleBootIPXE(w http.ResponseWriter, r *http.Request) {
@@ -474,9 +518,9 @@ func (s *Server) handleToggleSuperClient(w http.ResponseWriter, r *http.Request)
 
 	var err error
 	if payload.Enable {
-		err = s.images.StartSuperClient(id, payload.ExpireMinutes)
+		err = s.images.StartSuperClient(id, payload.ExpireMinutes, "admin")
 	} else {
-		err = s.images.DiscardSuperClient(id)
+		err = s.images.DiscardSuperClient(id, "admin")
 	}
 
 	if err != nil {
@@ -485,6 +529,102 @@ func (s *Server) handleToggleSuperClient(w http.ResponseWriter, r *http.Request)
 	}
 
 	s.jsonResponse(w, http.StatusOK, map[string]any{"success": true, "super_client": payload.Enable})
+}
+
+func (s *Server) handleCommitSuperClient(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		ClientID     string `json:"client_id"`
+		VersionTag   string `json:"version_tag"`
+		ReleaseNotes string `json:"release_notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+
+	version, err := s.images.CommitSuperClient(payload.ClientID, payload.VersionTag, payload.ReleaseNotes, "admin")
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, version)
+}
+
+func (s *Server) handleAssignDisk(w http.ResponseWriter, r *http.Request) {
+	diskID := r.PathValue("id")
+	var payload struct {
+		ClientID       string `json:"client_id"`
+		DeploymentType string `json:"deployment_type"`
+		MountPoint     string `json:"mount_point"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+
+	assignment, err := s.images.AssignDisk(payload.ClientID, diskID, payload.DeploymentType, payload.MountPoint, "admin")
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, assignment)
+}
+
+func (s *Server) handleUnassignDisk(w http.ResponseWriter, r *http.Request) {
+	clientID := r.PathValue("id")
+	if err := s.images.UnassignDisk(clientID, "admin"); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]string{"status": "unassigned"})
+}
+
+func (s *Server) handleListDiskVersions(w http.ResponseWriter, r *http.Request) {
+	diskID := r.PathValue("id")
+	versions, err := s.db.ListDiskVersions(diskID)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if versions == nil {
+		versions = []models.DiskVersion{}
+	}
+	s.jsonResponse(w, http.StatusOK, versions)
+}
+
+func (s *Server) handleRollbackDisk(w http.ResponseWriter, r *http.Request) {
+	diskID := r.PathValue("id")
+	var payload struct {
+		VersionID string `json:"version_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+
+	ver, err := s.images.RollbackToVersion(diskID, payload.VersionID, "admin")
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, ver)
+}
+
+func (s *Server) handleValidateDisk(w http.ResponseWriter, r *http.Request) {
+	diskID := r.PathValue("id")
+	ok, checksum, err := s.images.ValidateImage(diskID)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, map[string]any{
+		"valid":    ok,
+		"checksum": checksum,
+	})
 }
 
 func (s *Server) handleRebootClient(w http.ResponseWriter, r *http.Request) {

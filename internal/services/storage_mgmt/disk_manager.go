@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -16,7 +18,7 @@ import (
 	"nkb-diskless/internal/models"
 )
 
-// DiskManager handles physical disk files, sparse allocation, differential caches, and version trees.
+// DiskManager handles local VHDX operations, sparse allocation, differential caches, and version trees.
 type DiskManager struct {
 	cfg *config.Config
 	db  *database.DB
@@ -25,7 +27,6 @@ type DiskManager struct {
 
 // NewDiskManager initializes storage manager with configured paths.
 func NewDiskManager(cfg *config.Config, db *database.DB) (*DiskManager, error) {
-	// Ensure storage directories exist
 	dirs := []string{cfg.DisksDir, cfg.CacheDir, cfg.SnapshotsDir}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0755); err != nil {
@@ -39,37 +40,59 @@ func NewDiskManager(cfg *config.Config, db *database.DB) (*DiskManager, error) {
 	}, nil
 }
 
-// CreateVirtualDisk provisions a new virtual disk file on storage.
+// CreateVirtualDisk provisions a new virtual disk file on storage (dynamic sparse allocation).
 func (dm *DiskManager) CreateVirtualDisk(name string, sizeBytes int64, format string, osType string, description string) (*models.VirtualDisk, error) {
+	return dm.CreateVHDX(name, sizeBytes, true, osType, description)
+}
+
+// CreateVHDX provisions a dynamically expanding or fixed VHDX image.
+func (dm *DiskManager) CreateVHDX(name string, sizeBytes int64, isDynamic bool, osType string, description string) (*models.VirtualDisk, error) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	format = strings.ToUpper(format)
-	if format == "" {
-		format = "VHDX"
-	}
-
 	sanitizedName := strings.ToLower(strings.ReplaceAll(name, " ", "_"))
-	filename := fmt.Sprintf("%s.%s", sanitizedName, strings.ToLower(format))
+	filename := fmt.Sprintf("%s.vhdx", sanitizedName)
 	diskPath := filepath.Join(dm.cfg.DisksDir, filename)
 
 	if _, err := os.Stat(diskPath); err == nil {
 		return nil, fmt.Errorf("disk file already exists at %s", diskPath)
 	}
 
-	// Create sparse file
-	file, err := os.Create(diskPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create disk file: %w", err)
-	}
-	defer file.Close()
-
-	if sizeBytes > 0 {
-		// Truncate to desired virtual capacity (sparse on NTFS/ext4)
-		if err := file.Truncate(sizeBytes); err != nil {
-			_ = os.Remove(diskPath)
-			return nil, fmt.Errorf("failed to truncate virtual disk size: %w", err)
+	// If running on Windows, we can use diskpart to initialize proper VHDX header
+	if runtime.GOOS == "windows" {
+		diskType := "expandable"
+		if !isDynamic {
+			diskType = "fixed"
 		}
+		maxMB := sizeBytes / (1024 * 1024)
+		if maxMB <= 0 {
+			maxMB = 50 * 1024 // 50GB default
+		}
+
+		diskpartScript := fmt.Sprintf("create vdisk file=\"%s\" maximum=%d type=%s\n", diskPath, maxMB, diskType)
+		cmd := exec.Command("diskpart")
+		cmd.Stdin = strings.NewReader(diskpartScript)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			slog.Warn("diskpart create vdisk failed; using sparse file fallback", "err", err, "out", string(out))
+			// Fallback to sparse allocation
+			file, fErr := os.Create(diskPath)
+			if fErr != nil {
+				return nil, fErr
+			}
+			_ = file.Truncate(sizeBytes)
+			_ = file.Close()
+		}
+	} else {
+		// Non-Windows fallback (sparse file)
+		file, err := os.Create(diskPath)
+		if err != nil {
+			return nil, err
+		}
+		if sizeBytes > 0 {
+			_ = file.Truncate(sizeBytes)
+		}
+		_ = file.Close()
 	}
 
 	disk := &models.VirtualDisk{
@@ -77,7 +100,7 @@ func (dm *DiskManager) CreateVirtualDisk(name string, sizeBytes int64, format st
 		Description: description,
 		FilePath:    diskPath,
 		SizeBytes:   sizeBytes,
-		DiskFormat:  format,
+		DiskFormat:  "VHDX",
 		IsGolden:    true,
 		IsLocked:    false,
 		OSType:      osType,
@@ -90,6 +113,176 @@ func (dm *DiskManager) CreateVirtualDisk(name string, sizeBytes int64, format st
 
 	slog.Info("Created virtual disk image", "name", name, "path", diskPath, "size_gb", sizeBytes/(1024*1024*1024))
 	return disk, nil
+}
+
+// MountVHDX attaches the virtual disk locally in Windows.
+func (dm *DiskManager) MountVHDX(diskID string) (string, error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	disk, err := dm.db.GetDiskByID(diskID)
+	if err != nil || disk == nil {
+		return "", fmt.Errorf("disk not found: %s", diskID)
+	}
+
+	if runtime.GOOS == "windows" {
+		script := fmt.Sprintf("select vdisk file=\"%s\"\nattach vdisk readonly\n", disk.FilePath)
+		cmd := exec.Command("diskpart")
+		cmd.Stdin = strings.NewReader(script)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("failed to attach vdisk: %v (%s)", err, string(out))
+		}
+		slog.Info("Mounted VHDX disk", "name", disk.Name, "path", disk.FilePath)
+		return disk.FilePath, nil
+	}
+
+	return disk.FilePath, nil
+}
+
+// DismountVHDX detaches the virtual disk locally in Windows.
+func (dm *DiskManager) DismountVHDX(diskID string) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	disk, err := dm.db.GetDiskByID(diskID)
+	if err != nil || disk == nil {
+		return fmt.Errorf("disk not found: %s", diskID)
+	}
+
+	if runtime.GOOS == "windows" {
+		script := fmt.Sprintf("select vdisk file=\"%s\"\ndetach vdisk\n", disk.FilePath)
+		cmd := exec.Command("diskpart")
+		cmd.Stdin = strings.NewReader(script)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to detach vdisk: %v (%s)", err, string(out))
+		}
+		slog.Info("Dismounted VHDX disk", "name", disk.Name, "path", disk.FilePath)
+	}
+
+	return nil
+}
+
+// ImportDisk registers an existing VHD/VHDX into the repository.
+func (dm *DiskManager) ImportDisk(sourcePath string, name string, osType string) (*models.VirtualDisk, error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	fi, err := os.Stat(sourcePath)
+	if err != nil {
+		return nil, fmt.Errorf("source file does not exist: %w", err)
+	}
+
+	ext := strings.ToUpper(strings.TrimPrefix(filepath.Ext(sourcePath), "."))
+	if ext != "VHD" && ext != "VHDX" && ext != "RAW" {
+		ext = "VHDX"
+	}
+
+	disk := &models.VirtualDisk{
+		Name:        name,
+		Description: fmt.Sprintf("Imported from %s", sourcePath),
+		FilePath:    sourcePath,
+		SizeBytes:   fi.Size(),
+		DiskFormat:  ext,
+		IsGolden:    true,
+		IsLocked:    false,
+		OSType:      osType,
+	}
+
+	if err := dm.db.CreateDisk(disk); err != nil {
+		return nil, err
+	}
+
+	slog.Info("Imported virtual disk into NKB repository", "name", name, "path", sourcePath)
+	return disk, nil
+}
+
+// ExportDisk copies a virtual disk to an external export directory.
+func (dm *DiskManager) ExportDisk(diskID string, destDir string) (string, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	disk, err := dm.db.GetDiskByID(diskID)
+	if err != nil || disk == nil {
+		return "", fmt.Errorf("disk not found: %s", diskID)
+	}
+
+	_ = os.MkdirAll(destDir, 0755)
+	destPath := filepath.Join(destDir, filepath.Base(disk.FilePath))
+
+	srcFile, err := os.Open(disk.FilePath)
+	if err != nil {
+		return "", fmt.Errorf("cannot open source disk: %w", err)
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(destPath)
+	if err != nil {
+		return "", fmt.Errorf("cannot create destination disk: %w", err)
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		_ = os.Remove(destPath)
+		return "", fmt.Errorf("failed to copy disk data: %w", err)
+	}
+
+	slog.Info("Exported virtual disk", "name", disk.Name, "dest", destPath)
+	return destPath, nil
+}
+
+// AssignWorkstation binds a virtual disk to a specific workstation.
+func (dm *DiskManager) AssignWorkstation(diskID string, clientID string, deploymentType string) error {
+	client, err := dm.db.GetClientByID(clientID)
+	if err != nil || client == nil {
+		return fmt.Errorf("client %s not found", clientID)
+	}
+
+	disk, err := dm.db.GetDiskByID(diskID)
+	if err != nil || disk == nil {
+		return fmt.Errorf("disk %s not found", diskID)
+	}
+
+	client.AssignedDiskID = &diskID
+	if err := dm.db.UpdateClient(client); err != nil {
+		return err
+	}
+
+	_ = dm.db.RecordAudit(nil, "admin", "DISK_ASSIGN", "client", clientID,
+		fmt.Sprintf("Assigned disk %s to workstation %s (Deployment: %s)", disk.Name, client.Hostname, deploymentType), "")
+
+	slog.Info("Assigned virtual disk to workstation", "client", client.Hostname, "disk", disk.Name)
+	return nil
+}
+
+// VerifyIntegrity calculates SHA256 of the master disk image and compares against stored hash.
+func (dm *DiskManager) VerifyIntegrity(diskID string) (bool, string, error) {
+	disk, err := dm.db.GetDiskByID(diskID)
+	if err != nil || disk == nil {
+		return false, "", fmt.Errorf("disk not found")
+	}
+
+	file, err := os.Open(disk.FilePath)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to open disk file: %w", err)
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return false, "", fmt.Errorf("checksum calculation failed: %w", err)
+	}
+
+	currentHash := hex.EncodeToString(hasher.Sum(nil))
+	if disk.ChecksumSHA256 == "" {
+		disk.ChecksumSHA256 = currentHash
+		_ = dm.db.UpdateDisk(disk)
+		return true, currentHash, nil
+	}
+
+	match := strings.EqualFold(currentHash, disk.ChecksumSHA256)
+	return match, currentHash, nil
 }
 
 // AllocateClientWriteCache ensures a client has a differential write-cache delta file.
@@ -137,7 +330,6 @@ func (dm *DiskManager) PurgeClientWriteCache(clientID string) error {
 	matches, _ := filepath.Glob(pattern)
 
 	for _, match := range matches {
-		// Truncate back to empty or re-initialize
 		f, err := os.OpenFile(match, os.O_TRUNC|os.O_WRONLY, 0644)
 		if err == nil {
 			_ = f.Truncate(20 * 1024 * 1024 * 1024)
@@ -147,29 +339,4 @@ func (dm *DiskManager) PurgeClientWriteCache(clientID string) error {
 	}
 
 	return nil
-}
-
-// ComputeChecksum calculates SHA256 of the master disk image for verification.
-func (dm *DiskManager) ComputeChecksum(diskID string) (string, error) {
-	disk, err := dm.db.GetDiskByID(diskID)
-	if err != nil || disk == nil {
-		return "", fmt.Errorf("disk not found")
-	}
-
-	file, err := os.Open(disk.FilePath)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return "", err
-	}
-
-	sum := hex.EncodeToString(hasher.Sum(nil))
-	disk.ChecksumSHA256 = sum
-	_ = dm.db.UpdateDisk(disk)
-
-	return sum, nil
 }
