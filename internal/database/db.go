@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -14,10 +15,11 @@ import (
 
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
 
-// DB wraps the standard *sql.DB connection pool with NKB repository operations.
+// DB wraps standard *sql.DB connection pool with NKB repository operations.
 type DB struct {
 	*sql.DB
 	driver string
@@ -47,7 +49,6 @@ func Connect(cfg *config.Config) (*DB, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 		}
-		// Optimize SQLite concurrency
 		_, _ = conn.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
 	}
 
@@ -96,7 +97,7 @@ func parseNullTime(val any) *time.Time {
 	return &t
 }
 
-// Migrate executes schema migrations.
+// Migrate executes schema migrations in chronological order.
 func (db *DB) Migrate(migrationsDir string) error {
 	createMigrationTable := `
 	CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -167,6 +168,9 @@ func (db *DB) Migrate(migrationsDir string) error {
 		slog.Info("Successfully applied migration", "migration", migrationName)
 	}
 
+	// Seed default administrator if users table is empty
+	_ = db.EnsureDefaultAdmin()
+
 	return nil
 }
 
@@ -187,7 +191,81 @@ func (db *DB) rebind(query string) string {
 	return b.String()
 }
 
-// ----------------- CLIENTS REPOSITORY -----------------
+// ----------------- USERS & RBAC REPOSITORY -----------------
+
+func (db *DB) EnsureDefaultAdmin() error {
+	var count int
+	_ = db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+	if count == 0 {
+		hash, err := bcrypt.GenerateFromPassword([]byte("nkbadmin2026"), bcrypt.DefaultCost)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		q := db.rebind(`
+		INSERT INTO users (id, username, password_hash, full_name, role, is_active, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+		_, err = db.Exec(q, uuid.New().String(), "admin", string(hash), "System Administrator", "superadmin", true, now.Format(time.RFC3339), now.Format(time.RFC3339))
+		if err == nil {
+			slog.Info("Initialized default administrator account", "username", "admin")
+		}
+		return err
+	}
+	return nil
+}
+
+func (db *DB) VerifyUserPassword(username, password string) (*models.User, error) {
+	q := db.rebind(`
+	SELECT id, username, password_hash, full_name, role, is_active, last_login, created_at, updated_at
+	FROM users WHERE username = ? AND is_active = true`)
+
+	var u models.User
+	var lastLoginRaw, createdRaw, updatedRaw any
+	var fn sql.NullString
+
+	err := db.QueryRow(q, username).Scan(
+		&u.ID, &u.Username, &u.PasswordHash, &fn, &u.Role, &u.IsActive,
+		&lastLoginRaw, &createdRaw, &updatedRaw,
+	)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("invalid credentials")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
+		return nil, fmt.Errorf("invalid credentials")
+	}
+
+	if fn.Valid { u.FullName = fn.String }
+	u.LastLogin = parseNullTime(lastLoginRaw)
+	u.CreatedAt = parseTime(createdRaw)
+	u.UpdatedAt = parseTime(updatedRaw)
+
+	// Record last login
+	now := time.Now()
+	_, _ = db.Exec(db.rebind("UPDATE users SET last_login = ? WHERE id = ?"), now.Format(time.RFC3339), u.ID)
+
+	return &u, nil
+}
+
+func (db *DB) GetUserByID(id string) (*models.User, error) {
+	q := db.rebind(`SELECT id, username, full_name, role, is_active, created_at, updated_at FROM users WHERE id = ?`)
+	var u models.User
+	var fn sql.NullString
+	var cr, up any
+	err := db.QueryRow(q, id).Scan(&u.ID, &u.Username, &fn, &u.Role, &u.IsActive, &cr, &up)
+	if err != nil {
+		return nil, err
+	}
+	if fn.Valid { u.FullName = fn.String }
+	u.CreatedAt = parseTime(cr)
+	u.UpdatedAt = parseTime(up)
+	return &u, nil
+}
+
+// ----------------- CLIENTS & WORKSTATIONS REPOSITORY -----------------
 
 func (db *DB) ListClients() ([]models.Client, error) {
 	q := `
@@ -236,14 +314,27 @@ func (db *DB) ListClients() ([]models.Client, error) {
 		if grpName.Valid { c.GroupName = grpName.String }
 		if diskName.Valid { c.AssignedDiskName = diskName.String }
 
+		// Parse HardwareInfo metadata
+		if c.HardwareInfo != "" {
+			var hwMap map[string]any
+			if err := json.Unmarshal([]byte(c.HardwareInfo), &hwMap); err == nil {
+				if user, ok := hwMap["logged_in_user"].(string); ok { c.LoggedInUser = user }
+				if osVer, ok := hwMap["os_version"].(string); ok { c.OSVersion = osVer }
+				if upt, ok := hwMap["uptime_seconds"].(float64); ok { c.UptimeSec = int64(upt) }
+				if agentSt, ok := hwMap["agent_status"].(string); ok { c.AgentStatus = agentSt }
+				if agentVer, ok := hwMap["agent_version"].(string); ok { c.AgentVersion = agentVer }
+				if cpuPct, ok := hwMap["cpu_usage_pct"].(float64); ok { c.CPUUsagePct = float32(cpuPct) }
+				if ramPct, ok := hwMap["ram_usage_pct"].(float64); ok { c.RAMUsagePct = float32(ramPct) }
+			}
+		}
+
 		clients = append(clients, c)
 	}
 
 	return clients, nil
 }
 
-func (db *DB) GetClientByMAC(mac string) (*models.Client, error) {
-	macNorm := strings.ToUpper(strings.ReplaceAll(mac, "-", ":"))
+func (db *DB) GetClientByID(id string) (*models.Client, error) {
 	q := db.rebind(`
 	SELECT c.id, c.mac_address, c.ip_address, c.hostname, c.group_id, c.assigned_disk_id,
 	       c.status, c.is_super_client, c.super_client_expires_at, c.boot_mode, c.write_cache_mode,
@@ -252,14 +343,14 @@ func (db *DB) GetClientByMAC(mac string) (*models.Client, error) {
 	FROM clients c
 	LEFT JOIN client_groups g ON c.group_id = g.id
 	LEFT JOIN virtual_disks d ON c.assigned_disk_id = d.id
-	WHERE UPPER(c.mac_address) = ?`)
+	WHERE c.id = ?`)
 
 	var c models.Client
 	var ip, hw, gid, did sql.NullString
 	var superExpRaw, lastBootRaw, lastSeenRaw, createdRaw, updatedRaw any
 	var grpName, diskName sql.NullString
 
-	err := db.QueryRow(q, macNorm).Scan(
+	err := db.QueryRow(q, id).Scan(
 		&c.ID, &c.MACAddress, &ip, &c.Hostname, &gid, &did,
 		&c.Status, &c.IsSuperClient, &superExpRaw, &c.BootMode, &c.WriteCacheMode,
 		&hw, &lastBootRaw, &lastSeenRaw, &createdRaw, &updatedRaw,
@@ -287,7 +378,8 @@ func (db *DB) GetClientByMAC(mac string) (*models.Client, error) {
 	return &c, nil
 }
 
-func (db *DB) GetClientByID(id string) (*models.Client, error) {
+func (db *DB) GetClientByMAC(mac string) (*models.Client, error) {
+	macNorm := strings.ToUpper(strings.ReplaceAll(mac, "-", ":"))
 	q := db.rebind(`
 	SELECT c.id, c.mac_address, c.ip_address, c.hostname, c.group_id, c.assigned_disk_id,
 	       c.status, c.is_super_client, c.super_client_expires_at, c.boot_mode, c.write_cache_mode,
@@ -296,14 +388,14 @@ func (db *DB) GetClientByID(id string) (*models.Client, error) {
 	FROM clients c
 	LEFT JOIN client_groups g ON c.group_id = g.id
 	LEFT JOIN virtual_disks d ON c.assigned_disk_id = d.id
-	WHERE c.id = ?`)
+	WHERE UPPER(c.mac_address) = ?`)
 
 	var c models.Client
 	var ip, hw, gid, did sql.NullString
 	var superExpRaw, lastBootRaw, lastSeenRaw, createdRaw, updatedRaw any
 	var grpName, diskName sql.NullString
 
-	err := db.QueryRow(q, id).Scan(
+	err := db.QueryRow(q, macNorm).Scan(
 		&c.ID, &c.MACAddress, &ip, &c.Hostname, &gid, &did,
 		&c.Status, &c.IsSuperClient, &superExpRaw, &c.BootMode, &c.WriteCacheMode,
 		&hw, &lastBootRaw, &lastSeenRaw, &createdRaw, &updatedRaw,
@@ -427,6 +519,253 @@ func (db *DB) RecordHeartbeat(mac string, ip string, hardwareSpecs string) error
 		return db.CreateClient(autoClient)
 	}
 	return nil
+}
+
+// ----------------- AGENT REGISTRATION & HEARTBEAT -----------------
+
+func (db *DB) RegisterAgent(req *models.AgentRegisterRequest) (*models.AgentRegisterResponse, error) {
+	macNorm := strings.ToUpper(strings.ReplaceAll(req.MACAddress, "-", ":"))
+	client, err := db.GetClientByMAC(macNorm)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	var clientID string
+
+	if client == nil {
+		clientID = uuid.New().String()
+		client = &models.Client{
+			ID:             clientID,
+			MACAddress:     macNorm,
+			IPAddress:      req.IPAddress,
+			Hostname:       req.Hostname,
+			Status:         "online",
+			BootMode:       "UEFI",
+			WriteCacheMode: "volatile",
+			HardwareInfo:   req.HardwareInfo,
+			LastSeen:       &now,
+		}
+		if err := db.CreateClient(client); err != nil {
+			return nil, err
+		}
+	} else {
+		clientID = client.ID
+		client.Hostname = req.Hostname
+		client.IPAddress = req.IPAddress
+		client.Status = "online"
+		client.HardwareInfo = req.HardwareInfo
+		client.LastSeen = &now
+		if err := db.UpdateClient(client); err != nil {
+			return nil, err
+		}
+	}
+
+	// Generate secure device token
+	deviceToken := fmt.Sprintf("nkb_agt_%s_%s", strings.ReplaceAll(macNorm, ":", ""), uuid.New().String()[:16])
+	secretHash, _ := bcrypt.GenerateFromPassword([]byte(deviceToken), bcrypt.DefaultCost)
+
+	// Save or update agent credential
+	credID := uuid.New().String()
+	qCred := db.rebind(`
+	INSERT INTO agent_credentials (id, client_id, device_token, secret_hash, status, last_authenticated_at, created_at)
+	VALUES (?, ?, ?, ?, 'active', ?, ?)`)
+	_, err = db.Exec(qCred, credID, clientID, deviceToken, string(secretHash), now.Format(time.RFC3339), now.Format(time.RFC3339))
+	if err != nil {
+		// If exists, update
+		qUpd := db.rebind(`UPDATE agent_credentials SET device_token = ?, secret_hash = ?, last_authenticated_at = ? WHERE client_id = ?`)
+		_, _ = db.Exec(qUpd, deviceToken, string(secretHash), now.Format(time.RFC3339), clientID)
+	}
+
+	return &models.AgentRegisterResponse{
+		ClientID:    clientID,
+		DeviceToken: deviceToken,
+		Status:      "registered",
+	}, nil
+}
+
+func (db *DB) AuthenticateAgent(deviceToken string) (*models.Client, error) {
+	q := db.rebind(`
+	SELECT c.id, c.mac_address, c.ip_address, c.hostname, c.status
+	FROM agent_credentials ac
+	JOIN clients c ON ac.client_id = c.id
+	WHERE ac.device_token = ? AND ac.status = 'active'`)
+
+	var c models.Client
+	var ip sql.NullString
+	err := db.QueryRow(q, deviceToken).Scan(&c.ID, &c.MACAddress, &ip, &c.Hostname, &c.Status)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("invalid or revoked device token")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if ip.Valid { c.IPAddress = ip.String }
+
+	// Update auth timestamp
+	now := time.Now()
+	_, _ = db.Exec(db.rebind(`UPDATE agent_credentials SET last_authenticated_at = ? WHERE device_token = ?`), now.Format(time.RFC3339), deviceToken)
+
+	return &c, nil
+}
+
+func (db *DB) ProcessAgentHeartbeat(clientID string, req *models.AgentHeartbeatRequest) error {
+	now := time.Now()
+
+	// Build enriched HardwareInfo JSON payload
+	hwData := map[string]any{
+		"logged_in_user": req.LoggedInUser,
+		"uptime_seconds": req.UptimeSec,
+		"cpu_usage_pct":  req.CPUUsagePct,
+		"ram_usage_pct":  req.RAMUsagePct,
+		"disk_usage_pct": req.DiskUsagePct,
+		"network_rx_mbs": req.NetworkRxMBs,
+		"network_tx_mbs": req.NetworkTxMBs,
+		"agent_status":   req.AgentStatus,
+	}
+	hwBytes, _ := json.Marshal(hwData)
+
+	q := db.rebind(`
+	UPDATE clients SET
+		status = 'online',
+		last_seen = ?,
+		hardware_info = ?
+	WHERE id = ?`)
+
+	_, err := db.Exec(q, now.Format(time.RFC3339), string(hwBytes), clientID)
+	return err
+}
+
+// ----------------- REMOTE COMMANDS REPOSITORY -----------------
+
+func (db *DB) QueueCommand(cmd *models.RemoteCommand) error {
+	if cmd.ID == "" {
+		cmd.ID = uuid.New().String()
+	}
+	now := time.Now()
+	cmd.CreatedAt = now
+	cmd.Status = "pending"
+
+	var expStr *string
+	if cmd.ExpiresAt != nil {
+		es := cmd.ExpiresAt.Format(time.RFC3339)
+		expStr = &es
+	}
+
+	q := db.rebind(`
+	INSERT INTO commands (id, client_id, issuer_user_id, issuer_username, command_type, payload, status, created_at, expires_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+
+	_, err := db.Exec(q, cmd.ID, cmd.ClientID, cmd.IssuerUserID, cmd.IssuerUsername, cmd.CommandType, cmd.Payload, cmd.Status, now.Format(time.RFC3339), expStr)
+	return err
+}
+
+func (db *DB) GetPendingCommands(clientID string) ([]models.RemoteCommand, error) {
+	q := db.rebind(`
+	SELECT id, client_id, issuer_user_id, issuer_username, command_type, payload, status, created_at
+	FROM commands WHERE client_id = ? AND status = 'pending' ORDER BY created_at ASC`)
+
+	rows, err := db.Query(q, clientID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var cmds []models.RemoteCommand
+	for rows.Next() {
+		var c models.RemoteCommand
+		var uid, un, pl sql.NullString
+		var cr any
+		err := rows.Scan(&c.ID, &c.ClientID, &uid, &un, &c.CommandType, &pl, &c.Status, &cr)
+		if err != nil {
+			return nil, err
+		}
+		if uid.Valid { c.IssuerUserID = &uid.String }
+		if un.Valid { c.IssuerUsername = un.String }
+		if pl.Valid { c.Payload = pl.String }
+		c.CreatedAt = parseTime(cr)
+		cmds = append(cmds, c)
+	}
+
+	// Mark queried commands as sent
+	if len(cmds) > 0 {
+		_, _ = db.Exec(db.rebind(`UPDATE commands SET status = 'sent' WHERE client_id = ? AND status = 'pending'`), clientID)
+	}
+
+	return cmds, nil
+}
+
+func (db *DB) RecordCommandResult(res *models.CommandResult) error {
+	if res.ID == "" {
+		res.ID = uuid.New().String()
+	}
+	now := time.Now()
+	res.CompletedAt = &now
+
+	q := db.rebind(`
+	INSERT INTO command_results (id, command_id, client_id, exit_code, output, error_message, executed_at, completed_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+
+	_, err := db.Exec(q, res.ID, res.CommandID, res.ClientID, res.ExitCode, res.Output, res.ErrorMessage, res.ExecutedAt.Format(time.RFC3339), now.Format(time.RFC3339))
+	if err != nil {
+		return err
+	}
+
+	status := "completed"
+	if res.ExitCode != 0 {
+		status = "failed"
+	}
+	_, _ = db.Exec(db.rebind(`UPDATE commands SET status = ? WHERE id = ?`), status, res.CommandID)
+	return nil
+}
+
+func (db *DB) ListCommands(clientID string, limit int) ([]models.RemoteCommand, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	q := db.rebind(`
+	SELECT c.id, c.client_id, c.issuer_username, c.command_type, c.payload, c.status, c.created_at,
+	       cr.exit_code, cr.output, cr.error_message
+	FROM commands c
+	LEFT JOIN command_results cr ON c.id = cr.command_id
+	WHERE c.client_id = ?
+	ORDER BY c.created_at DESC LIMIT ?`)
+
+	rows, err := db.Query(q, clientID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var cmds []models.RemoteCommand
+	for rows.Next() {
+		var c models.RemoteCommand
+		var un, pl sql.NullString
+		var cr any
+		var exitCode sql.NullInt32
+		var output, errMsg sql.NullString
+
+		err := rows.Scan(&c.ID, &c.ClientID, &un, &c.CommandType, &pl, &c.Status, &cr, &exitCode, &output, &errMsg)
+		if err != nil {
+			return nil, err
+		}
+		if un.Valid { c.IssuerUsername = un.String }
+		if pl.Valid { c.Payload = pl.String }
+		c.CreatedAt = parseTime(cr)
+
+		if exitCode.Valid {
+			c.Result = &models.CommandResult{
+				CommandID:    c.ID,
+				ClientID:     c.ClientID,
+				ExitCode:     int(exitCode.Int32),
+				Output:       output.String,
+				ErrorMessage: errMsg.String,
+			}
+		}
+
+		cmds = append(cmds, c)
+	}
+	return cmds, nil
 }
 
 // ----------------- VIRTUAL DISKS REPOSITORY -----------------

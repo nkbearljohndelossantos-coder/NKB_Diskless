@@ -16,6 +16,7 @@ import (
 	"nkb-diskless/internal/config"
 	"nkb-diskless/internal/database"
 	"nkb-diskless/internal/models"
+	"nkb-diskless/internal/services/auth_rbac"
 	"nkb-diskless/internal/services/image_mgmt"
 	"nkb-diskless/internal/services/monitoring"
 	"nkb-diskless/internal/services/pxe_boot"
@@ -99,6 +100,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	authService := auth_rbac.NewAuthService(cfg.JWTSecret, db, cfg.TokenExpiration)
+
 	// 4. Start Network Boot Infrastructure
 	// TFTP Service (Optional / Configurable)
 	if cfg.EnableTFTP {
@@ -121,7 +124,7 @@ func main() {
 	}
 
 	// 5. Initialize API Server
-	apiServer := api.NewServer(cfg, db, telemetry, diskManager, iscsiController, imageService, updateManager)
+	apiServer := api.NewServer(cfg, db, telemetry, diskManager, iscsiController, imageService, updateManager, authService)
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.BindAddress, cfg.APIPort),
 		Handler:      apiServer.Handler(),
