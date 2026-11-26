@@ -407,6 +407,13 @@ func (s *StandaloneDHCPServer) handlePacket(remoteAddr *net.UDPAddr, req []byte)
 	binary.BigEndian.PutUint32(resp[optIdx+2:optIdx+6], 75600)
 	optIdx += 6
 
+	// Option 60: Vendor Class Identifier = "PXEClient" (REQUIRED for UEFI PXE ROMs)
+	vendorClass := []byte("PXEClient")
+	resp[optIdx] = 60
+	resp[optIdx+1] = byte(len(vendorClass))
+	copy(resp[optIdx+2:], vendorClass)
+	optIdx += 2 + len(vendorClass)
+
 	// Option 66: TFTP Server Name / Next-Server IP
 	serverIPStr := []byte(s.serverIP.String())
 	resp[optIdx] = 66
