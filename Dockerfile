@@ -9,9 +9,10 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: Build Go Backend
-FROM golang:1.24-alpine AS backend-builder
+FROM golang:alpine AS backend-builder
 WORKDIR /app
 RUN apk add --no-cache git
+ENV GOTOOLCHAIN=auto
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
