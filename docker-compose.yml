@@ -1,0 +1,19 @@
+services:
+  nkb-diskless:
+    container_name: nkb_diskless
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8450:8443"
+    volumes:
+      - nkb_diskless_data:/var/nkb-diskless
+    environment:
+      - TZ=Asia/Manila
+    labels:
+      - "com.docker.compose.project=nkb-diskless"
+
+volumes:
+  nkb_diskless_data:
+    name: nkb_diskless_data
