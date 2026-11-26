@@ -8,7 +8,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -64,10 +63,10 @@ func (p *ProxyDHCPServer) Start() error {
 		return fmt.Errorf("failed to bind ProxyDHCP on 0.0.0.0:%d: %w", p.port, err)
 	}
 
-	// Enable SO_BROADCAST on Windows
+	// Enable SO_BROADCAST
 	if rawConn, err := conn.SyscallConn(); err == nil {
 		_ = rawConn.Control(func(fd uintptr) {
-			_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1)
+			setBroadcast(fd)
 		})
 	}
 	p.conn = conn
