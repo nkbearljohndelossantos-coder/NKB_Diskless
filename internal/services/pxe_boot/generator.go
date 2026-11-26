@@ -2,6 +2,7 @@ package pxe_boot
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"nkb-diskless/internal/database"
@@ -90,12 +91,20 @@ func GenerateScript(req BootRequest, db *database.DB) (string, error) {
 func generateNormalBootScript(req BootRequest, client *models.Client, db *database.DB) string {
 	var diskName string = "Default OS Image"
 	var diskID string
+	var hasOS bool = false
 
 	if client.AssignedDiskID != nil && *client.AssignedDiskID != "" {
 		diskID = *client.AssignedDiskID
 		d, _ := db.GetDiskByID(diskID)
 		if d != nil {
 			diskName = d.Name
+			if fi, err := os.Stat(d.FilePath); err == nil {
+				// Sparse / unpartitioned freshly created virtual disks are < 1GB (~4MB).
+				// Populated Windows OS installation images exceed 1GB (typically 8GB-25GB).
+				if fi.Size() > 1024*1024*1024 {
+					hasOS = true
+				}
+			}
 		}
 	} else if client.GroupID != nil && *client.GroupID != "" {
 		// Fall back to group's default disk
@@ -106,6 +115,11 @@ func generateNormalBootScript(req BootRequest, client *models.Client, db *databa
 				d, _ := db.GetDiskByID(diskID)
 				if d != nil {
 					diskName = d.Name
+					if fi, err := os.Stat(d.FilePath); err == nil {
+						if fi.Size() > 1024*1024*1024 {
+							hasOS = true
+						}
+					}
 				}
 				break
 			}
@@ -128,6 +142,13 @@ reboot
 `, client.Hostname, client.MACAddress, req.ServerIP, req.HTTPPort)
 	}
 
+	targetMode := "direct"
+	modePrompt := "Windows OS detected -> Booting directly to Windows Desktop..."
+	if !hasOS {
+		targetMode = "winpe"
+		modePrompt = "Empty/New Virtual Disk -> Launching Windows Network Installer (WinPE)..."
+	}
+
 	// Target IQN per client (e.g. iqn.2026-11.com.nkb:client-001a2b3c4d5e)
 	targetIQN := fmt.Sprintf("%s:client-%s", req.ISCSIPrefix, strings.ToLower(strings.ReplaceAll(client.MACAddress, ":", "")))
 
@@ -141,18 +162,22 @@ echo ========================================================
 set keep-san 1
 set net0/gateway 0.0.0.0
 
+echo [SMART DETECTION] %s
+echo
+
 menu NKB Boot Selection
-item --default direct  1. Boot Windows 11 (Diskless iSCSI)
-item winpe             2. Windows 11 Network Installer (WinPE)
-item shell             3. iPXE Command Shell
-choose --timeout 10000 --default direct target_mode && goto ${target_mode}
+item --default %s 1. [Auto] %s
+item direct         2. Direct Windows 11 Desktop (Diskless iSCSI)
+item winpe          3. Windows 11 Network Installer (WinPE)
+item shell          4. iPXE Command Shell
+choose --timeout 3000 --default %s target_mode && goto ${target_mode}
 
 :direct
 echo Connecting to NKB Virtual Block SAN and Booting Windows...
 sanboot iscsi:%s::::%s || goto san_fail
 
 :winpe
-echo Connecting SAN device for setup...
+echo Attaching Virtual Disk SAN target for Windows installation...
 sanhook iscsi:%s::::%s || goto san_fail
 echo Loading Windows 11 Network Installer via wimboot...
 kernel http://%s:8080/wimboot
@@ -171,6 +196,9 @@ echo Checking write-cache allocation and iSCSI target daemon...
 prompt --timeout 15000 Press any key to retry or wait 15 seconds to reboot...
 reboot
 `, client.Hostname, client.MACAddress, diskName, client.WriteCacheMode,
+		modePrompt,
+		targetMode, modePrompt,
+		targetMode,
 		req.ServerIP, targetIQN,
 		req.ServerIP, targetIQN,
 		req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP,
@@ -179,15 +207,28 @@ reboot
 
 func generateSuperClientScript(req BootRequest, client *models.Client, db *database.DB) string {
 	var diskName string = "Golden Master Image"
+	var hasOS bool = false
 	if client.AssignedDiskID != nil {
 		d, _ := db.GetDiskByID(*client.AssignedDiskID)
 		if d != nil {
 			diskName = d.Name
+			if fi, err := os.Stat(d.FilePath); err == nil {
+				if fi.Size() > 1024*1024*1024 {
+					hasOS = true
+				}
+			}
 		}
 	}
 
 	// Super-client target IQN points directly to the writable snapshot
 	targetIQN := fmt.Sprintf("%s:superclient-%s", req.ISCSIPrefix, strings.ToLower(strings.ReplaceAll(client.MACAddress, ":", "")))
+
+	targetMode := "direct"
+	modePrompt := "Windows OS detected -> Booting writable snapshot directly..."
+	if !hasOS {
+		targetMode = "winpe"
+		modePrompt = "Empty Golden Image -> Launching WinPE to Install Windows directly..."
+	}
 
 	return fmt.Sprintf(`#!ipxe
 echo ========================================================
@@ -198,16 +239,49 @@ echo ========================================================
 echo [WARNING] All disk modifications will be persisted to the snapshot!
 echo Ensure you install drivers/software and run sysprep before sealing!
 set keep-san 1
+set net0/gateway 0.0.0.0
+
+echo [SMART DETECTION] %s
+echo
+
+menu NKB Super-Client Boot Selection
+item --default %s 1. [Auto] %s
+item direct         2. Direct Boot Windows (Writable SAN Target)
+item winpe          3. Windows 11 Network Installer (WinPE Setup)
+item shell          4. iPXE Command Shell
+choose --timeout 3000 --default %s target_mode && goto ${target_mode}
+
+:direct
+echo Attaching writable snapshot SAN target and booting...
 sanhook iscsi:%s::::%s || goto super_fail
 sanboot --no-describe iscsi:%s::::%s || goto super_fail
+
+:winpe
+echo Attaching writable snapshot SAN target for installation...
+sanhook iscsi:%s::::%s || goto super_fail
+echo Loading Windows 11 Network Installer via wimboot...
+kernel http://%s:8080/wimboot
+initrd http://%s:8080/winpe/bootmgr bootmgr
+initrd http://%s:8080/winpe/boot/bcd BCD
+initrd http://%s:8080/winpe/boot/boot.sdi boot.sdi
+initrd http://%s:8080/winpe/sources/boot.wim boot.wim
+boot
+
+:shell
+shell
 
 :super_fail
 echo [FATAL] Super-Client failed to attach writable snapshot target: %s
 prompt --timeout 15000 Press any key to reboot...
 reboot
 `, client.Hostname, client.MACAddress, diskName,
+		modePrompt,
+		targetMode, modePrompt,
+		targetMode,
 		req.ServerIP, targetIQN,
 		req.ServerIP, targetIQN,
+		req.ServerIP, targetIQN,
+		req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP,
 		targetIQN)
 }
 
