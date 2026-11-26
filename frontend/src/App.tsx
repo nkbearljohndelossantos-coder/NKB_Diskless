@@ -818,12 +818,8 @@ export default function App() {
       <div className={`min-h-screen flex items-center justify-center p-4 font-sans ${theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'bg-slate-100 text-slate-900'}`}>
         <div className={`w-full max-w-md p-8 rounded-xl border shadow-2xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
           <div className="flex items-center justify-between mb-6">
-            <div className="flex items-center gap-3">
-              <img src="/nkb-logo.png" alt="NKB Logo" className="w-12 h-12 object-contain rounded-lg shadow-md" />
-              <div>
-                <h1 className="text-base font-bold tracking-wide">DISKLESS SYSTEM</h1>
-                <p className="text-xs text-slate-400 font-medium">Enterprise Management Platform</p>
-              </div>
+            <div className="flex items-center">
+              <img src="/nkb-logo.png" alt="NKB Manufacturing Corp" className="h-12 w-auto object-contain drop-shadow-md" />
             </div>
             <button
               onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
@@ -906,13 +902,9 @@ export default function App() {
       <aside className="w-64 bg-[#0B132B] flex flex-col justify-between shrink-0 select-none border-r border-slate-800">
         <div className="overflow-y-auto">
           {/* Brand Header */}
-          <div className="p-5 border-b border-slate-800 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <img src="/nkb-logo.png" alt="NKB Logo" className="w-10 h-10 object-contain rounded shadow" />
-              <div>
-                <h1 className="text-white font-bold text-sm tracking-wide">DISKLESS</h1>
-                <p className="text-slate-400 text-xs font-medium">Enterprise Platform</p>
-              </div>
+          <div className="p-4 border-b border-slate-800 flex items-center justify-between">
+            <div className="flex items-center">
+              <img src="/nkb-logo.png" alt="NKB Manufacturing Corp" className="h-10 w-auto object-contain drop-shadow" />
             </div>
             <button
               onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
