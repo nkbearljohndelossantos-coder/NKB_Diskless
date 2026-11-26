@@ -179,6 +179,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/disks/{id}/validate", s.auth.RequireRole("admin")(s.handleValidateDisk))
 	s.mux.HandleFunc("GET /api/v1/installers", s.auth.RequireAuth(s.handleListInstallers))
 	s.mux.HandleFunc("POST /api/v1/disks/{id}/apply-os", s.auth.RequireRole("admin")(s.handleApplyOSImage))
+	s.mux.HandleFunc("GET /api/v1/disks/{id}/build-status", s.auth.RequireAuth(s.handleGetDiskBuildStatus))
 	s.mux.HandleFunc("POST /api/v1/super-client/commit", s.auth.RequireRole("admin")(s.handleCommitSuperClient))
 
 	// 6. Client Groups
@@ -1171,6 +1172,24 @@ func (s *Server) handleApplyOSImage(w http.ResponseWriter, r *http.Request) {
 		"status":  "deploying",
 		"message": fmt.Sprintf("OS image deployment from %s started. This will take 2-4 minutes in the background.", filepath.Base(payload.InstallerPath)),
 	})
+}
+
+func (s *Server) handleGetDiskBuildStatus(w http.ResponseWriter, r *http.Request) {
+	statusFile := filepath.Join(s.cfg.StorageRoot, "build_status.json")
+	if _, err := os.Stat(statusFile); os.IsNotExist(err) {
+		statusFile = `C:\NKB-PoC\build_status.json`
+	}
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		s.jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"status":  "idle",
+			"percent": 0,
+			"message": "No active build in progress",
+		})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
 }
 
 func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {

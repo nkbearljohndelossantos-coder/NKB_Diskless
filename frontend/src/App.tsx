@@ -207,6 +207,16 @@ export default function App() {
   const [availableEditions, setAvailableEditions] = useState<{ index: number; name: string; description: string }[]>([]);
   const [wimIndex, setWimIndex] = useState(1);
   const [isApplyingOS, setIsApplyingOS] = useState(false);
+  const [activeBuildStatus, setActiveBuildStatus] = useState<{
+    status: 'idle' | 'running' | 'completed' | 'failed';
+    step: number;
+    total_steps: number;
+    percent: number;
+    step_name: string;
+    message: string;
+    error: string;
+    updated_at: string;
+  } | null>(null);
 
   // Forms State
   const [newClient, setNewClient] = useState({ mac: '', hostname: '', group_id: '', disk_id: '' });
@@ -721,6 +731,8 @@ export default function App() {
 
   const handleOpenApplyOS = async (disk: VirtualDisk) => {
     setShowApplyOSModal(disk);
+    setActiveBuildStatus(null);
+    setIsApplyingOS(false);
     try {
       const res = await fetch('/api/v1/installers', { credentials: 'include' });
       if (res.ok) {
@@ -759,6 +771,16 @@ export default function App() {
   const handleExecuteApplyOS = async () => {
     if (!showApplyOSModal || !selectedInstallerPath) return;
     setIsApplyingOS(true);
+    setActiveBuildStatus({
+      status: 'running',
+      step: 1,
+      total_steps: 6,
+      percent: 5,
+      step_name: 'Initiating Image Builder',
+      message: 'Starting deployment process...',
+      error: '',
+      updated_at: ''
+    });
     showNotification(`Applying OS from ${selectedInstallerPath.split(/[\\/]/).pop()} to ${showApplyOSModal.name}...`);
     try {
       const res = await fetch(`/api/v1/disks/${showApplyOSModal.id}/apply-os`, {
@@ -772,16 +794,34 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        showNotification(data.message || 'OS image deployment started successfully!');
-        setShowApplyOSModal(null);
-        fetchDisks();
+        showNotification(data.message || 'OS image deployment started!');
+        const targetDiskId = showApplyOSModal.id;
+        const pollTimer = setInterval(async () => {
+          try {
+            const statusRes = await fetch(`/api/v1/disks/${targetDiskId}/build-status`, { credentials: 'include' });
+            if (statusRes.ok) {
+              const bStatus = await statusRes.json();
+              setActiveBuildStatus(bStatus);
+              if (bStatus.status === 'completed') {
+                clearInterval(pollTimer);
+                setIsApplyingOS(false);
+                showNotification('✓ Build Complete! Virtual Disk is ready to boot directly into Windows Desktop.');
+                fetchDisks();
+              } else if (bStatus.status === 'failed') {
+                clearInterval(pollTimer);
+                setIsApplyingOS(false);
+                showNotification(`Build Failed: ${bStatus.error || bStatus.message}`);
+              }
+            }
+          } catch { }
+        }, 1200);
       } else {
         const err = await res.json().catch(() => ({ error: 'Deployment failed' }));
         showNotification(`Deploy Error: ${err.error || 'Failed to start OS deployment'}`);
+        setIsApplyingOS(false);
       }
     } catch (err) {
       showNotification('Network error starting OS image deployment.');
-    } finally {
       setIsApplyingOS(false);
     }
   };
@@ -2532,6 +2572,56 @@ reboot`}
                   )}
                 </select>
               </div>
+
+              {/* LIVE BUILD PROGRESS INDICATOR */}
+              {activeBuildStatus && (
+                <div className={`p-4 rounded-lg border space-y-2.5 ${
+                  activeBuildStatus.status === 'failed'
+                    ? 'bg-red-50 dark:bg-red-950/40 border-red-300 dark:border-red-800 text-red-900 dark:text-red-200'
+                    : activeBuildStatus.status === 'completed'
+                    ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200'
+                    : 'bg-blue-50 dark:bg-blue-950/40 border-blue-300 dark:border-blue-800 text-blue-900 dark:text-blue-200'
+                }`}>
+                  <div className="flex justify-between items-center font-bold text-xs">
+                    <span className="flex items-center gap-1.5">
+                      {activeBuildStatus.status === 'running' && (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-blue-600 dark:text-blue-400" />
+                      )}
+                      {activeBuildStatus.status === 'completed' && (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                      )}
+                      {activeBuildStatus.status === 'failed' && (
+                        <AlertTriangle className="w-4 h-4 text-red-600 dark:text-red-400" />
+                      )}
+                      {activeBuildStatus.step_name}
+                    </span>
+                    <span className="font-mono">{activeBuildStatus.percent}%</span>
+                  </div>
+
+                  {/* PROGRESS BAR */}
+                  <div className="w-full h-2.5 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full transition-all duration-300 ${
+                        activeBuildStatus.status === 'failed'
+                          ? 'bg-red-600'
+                          : activeBuildStatus.status === 'completed'
+                          ? 'bg-emerald-600'
+                          : 'bg-blue-600 animate-pulse'
+                      }`}
+                      style={{ width: `${Math.max(5, activeBuildStatus.percent)}%` }}
+                    />
+                  </div>
+
+                  <p className="text-[11px] leading-tight font-medium">
+                    {activeBuildStatus.message}
+                  </p>
+                  {activeBuildStatus.error && (
+                    <p className="text-[11px] font-mono font-semibold text-red-600 dark:text-red-400 mt-1">
+                      Error: {activeBuildStatus.error}
+                    </p>
+                  )}
+                </div>
+              )}
 
               <div className="p-3 rounded bg-slate-50 dark:bg-slate-900 border text-slate-500 text-[11px] leading-relaxed">
                 <span className="font-semibold text-slate-700 dark:text-slate-300">⚡ Automated Fast Deployment:</span>
