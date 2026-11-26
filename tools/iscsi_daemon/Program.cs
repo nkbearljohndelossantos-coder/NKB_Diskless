@@ -31,6 +31,7 @@ namespace NKBDiskless.Daemon
             string vhdPath = @"C:\NKB-PoC\disks\virtual\prod_2.vhd";
             int diskNumber = -1;
             int port = 3260;
+            long sizeGb = 100;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -38,12 +39,14 @@ namespace NKBDiskless.Daemon
                 if (args[i] == "-vhd" && i + 1 < args.Length) vhdPath = args[++i];
                 if (args[i] == "-disk" && i + 1 < args.Length) int.TryParse(args[++i], out diskNumber);
                 if (args[i] == "-port" && i + 1 < args.Length) int.TryParse(args[++i], out port);
+                if (args[i] == "-size" && i + 1 < args.Length) long.TryParse(args[++i], out sizeGb);
             }
 
             Log(" Target IQN  : " + targetName);
             Log(" VHD Path    : " + vhdPath);
             Log(" Disk Number : " + (diskNumber >= 0 ? diskNumber.ToString() : "N/A"));
             Log(" Port        : " + port);
+            Log(" Target Size : " + sizeGb + " GB");
             Log("=================================================================");
 
             Disk disk = null;
@@ -65,6 +68,24 @@ namespace NKBDiskless.Daemon
 
             if (disk == null)
             {
+                // If VHD exists but is fresh/empty (< 10MB on disk), recreate it with desired size
+                if (File.Exists(vhdPath))
+                {
+                    try
+                    {
+                        FileInfo fi = new FileInfo(vhdPath);
+                        if (fi.Length < 10 * 1024 * 1024)
+                        {
+                            Log(string.Format("[*] Refreshing blank dynamic VHD to requested {0} GB...", sizeGb));
+                            File.Delete(vhdPath);
+                        }
+                    }
+                    catch (Exception exDel)
+                    {
+                        Log("[!] Could not delete old VHD: " + exDel.Message);
+                    }
+                }
+
                 if (!File.Exists(vhdPath))
                 {
                     try
@@ -74,14 +95,14 @@ namespace NKBDiskless.Daemon
                         {
                             Directory.CreateDirectory(dir);
                         }
-                        Log("[*] VHD not found. Auto-creating 60 GB Dynamic VHD: " + vhdPath);
-                        long sizeBytes = 60L * 1024 * 1024 * 1024;
+                        Log(string.Format("[*] Creating {0} GB Dynamic VHD: {1}", sizeGb, vhdPath));
+                        long sizeBytes = sizeGb * 1024L * 1024L * 1024L;
                         VirtualHardDisk.CreateDynamicDisk(vhdPath, sizeBytes);
-                        Log("[✓] 60 GB Dynamic VHD successfully created.");
+                        Log(string.Format("[✓] {0} GB Dynamic VHD successfully created.", sizeGb));
                     }
                     catch (Exception exCreate)
                     {
-                        Log("[X] Failed to auto-create VHD: " + exCreate.Message);
+                        Log("[X] Failed to create VHD: " + exCreate.Message);
                     }
                 }
 
