@@ -26,6 +26,10 @@ Write-Host "==========================================================" -Foregro
 Write-Host "   NKB DISKLESS SYSTEM - GOLDEN IMAGE BUILDER             " -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
+# Phase 2 Safety Policy: Prohibit physical disk or partition modifications
+Write-Error "DISABLED_BY_SAFETY_POLICY: Offline golden image staging script is disabled during Phase 2 PoC to prevent accidental disk or partition operations."
+exit 1
+
 $sanitizedName = $ImageName.ToLower().Replace(" ", "_")
 $vhdxPath = Join-Path (Resolve-Path $DestinationDir) "$sanitizedName.vhdx"
 

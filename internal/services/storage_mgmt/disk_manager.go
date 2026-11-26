@@ -40,6 +40,29 @@ func NewDiskManager(cfg *config.Config, db *database.DB) (*DiskManager, error) {
 	}, nil
 }
 
+// validateVirtualDiskPath ensures storage operations exclusively target project-contained virtual disk files (.vhdx / .vhd / .delta)
+// and strictly rejects any attempt to target physical disks, raw block devices, or volume partitions.
+func validateVirtualDiskPath(path string) error {
+	cleanPath := filepath.Clean(path)
+	lower := strings.ToLower(cleanPath)
+
+	if strings.Contains(lower, "physicaldrive") || strings.HasPrefix(lower, `\\.\`) || strings.HasPrefix(lower, `\\?\`) {
+		return fmt.Errorf("DISABLED_BY_SAFETY_POLICY: physical drive operations are prohibited")
+	}
+
+	ext := filepath.Ext(lower)
+	if ext != ".vhdx" && ext != ".vhd" && ext != ".delta" {
+		return fmt.Errorf("DISABLED_BY_SAFETY_POLICY: only virtual disk images (.vhdx, .vhd) are permitted, got: %s", ext)
+	}
+
+	return nil
+}
+
+// ModifyPhysicalDisk unconditionally rejects any physical disk modification during Phase 2 PoC.
+func (dm *DiskManager) ModifyPhysicalDisk(diskNumber int) error {
+	return fmt.Errorf("DISABLED_BY_SAFETY_POLICY: physical disk modification is prohibited")
+}
+
 // CreateVirtualDisk provisions a new virtual disk file on storage (dynamic sparse allocation).
 func (dm *DiskManager) CreateVirtualDisk(name string, sizeBytes int64, format string, osType string, description string) (*models.VirtualDisk, error) {
 	return dm.CreateVHDX(name, sizeBytes, true, osType, description)
@@ -50,7 +73,21 @@ func (dm *DiskManager) CreateVHDX(name string, sizeBytes int64, isDynamic bool, 
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	sanitizedName := strings.ToLower(strings.ReplaceAll(name, " ", "_"))
+	trimmedName := strings.TrimSpace(name)
+	if trimmedName == "" {
+		return nil, fmt.Errorf("disk name cannot be empty")
+	}
+	// Enforce strict character whitelist to prevent diskpart command injection and path traversal
+	for _, ch := range trimmedName {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == ' ' || ch == '_' || ch == '-' || ch == '.') {
+			return nil, fmt.Errorf("invalid disk name: contains forbidden characters: %q", name)
+		}
+	}
+	if strings.Contains(trimmedName, "..") || strings.Contains(trimmedName, "/") || strings.Contains(trimmedName, "\\") || strings.Contains(trimmedName, "\"") || strings.Contains(trimmedName, "\n") {
+		return nil, fmt.Errorf("invalid disk name: path traversal or command injection sequence detected: %q", name)
+	}
+
+	sanitizedName := strings.ToLower(strings.ReplaceAll(trimmedName, " ", "_"))
 	filename := fmt.Sprintf("%s.vhdx", sanitizedName)
 	diskPath := filepath.Join(dm.cfg.DisksDir, filename)
 
@@ -69,18 +106,19 @@ func (dm *DiskManager) CreateVHDX(name string, sizeBytes int64, isDynamic bool, 
 			maxMB = 50 * 1024 // 50GB default
 		}
 
-		diskpartScript := fmt.Sprintf("create vdisk file=\"%s\" maximum=%d type=%s\n", diskPath, maxMB, diskType)
+		diskpartScript := fmt.Sprintf("create vdisk file=\"%s\" maximum=%d type=%s\nselect vdisk file=\"%s\"\nattach vdisk\nconvert gpt\ncreate partition efi size=260\nformat quick fs=fat32 label=\"System\"\ncreate partition primary\nformat quick fs=ntfs label=\"NKB_OS\"\nassign\ndetach vdisk\n", diskPath, maxMB, diskType, diskPath)
 		cmd := exec.Command("diskpart")
 		cmd.Stdin = strings.NewReader(diskpartScript)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			slog.Warn("diskpart create vdisk failed; using sparse file fallback", "err", err, "out", string(out))
-			// Fallback to sparse allocation
-			file, fErr := os.Create(diskPath)
-			if fErr != nil {
-				return nil, fErr
+			slog.Warn("diskpart create vdisk failed (elevation required), falling back to sparse disk allocation", "err", err, "out", string(out))
+			file, createErr := os.Create(diskPath)
+			if createErr != nil {
+				return nil, fmt.Errorf("failed to create virtual disk file: %w", createErr)
 			}
-			_ = file.Truncate(sizeBytes)
+			if sizeBytes > 0 {
+				_ = file.Truncate(sizeBytes)
+			}
 			_ = file.Close()
 		}
 	} else {
@@ -123,6 +161,10 @@ func (dm *DiskManager) MountVHDX(diskID string) (string, error) {
 	disk, err := dm.db.GetDiskByID(diskID)
 	if err != nil || disk == nil {
 		return "", fmt.Errorf("disk not found: %s", diskID)
+	}
+
+	if err := validateVirtualDiskPath(disk.FilePath); err != nil {
+		return "", err
 	}
 
 	if runtime.GOOS == "windows" {
@@ -169,6 +211,10 @@ func (dm *DiskManager) ImportDisk(sourcePath string, name string, osType string)
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
+	if err := validateVirtualDiskPath(sourcePath); err != nil {
+		return nil, err
+	}
+
 	fi, err := os.Stat(sourcePath)
 	if err != nil {
 		return nil, fmt.Errorf("source file does not exist: %w", err)
@@ -206,6 +252,10 @@ func (dm *DiskManager) ExportDisk(diskID string, destDir string) (string, error)
 	disk, err := dm.db.GetDiskByID(diskID)
 	if err != nil || disk == nil {
 		return "", fmt.Errorf("disk not found: %s", diskID)
+	}
+
+	if err := validateVirtualDiskPath(disk.FilePath); err != nil {
+		return "", err
 	}
 
 	_ = os.MkdirAll(destDir, 0755)

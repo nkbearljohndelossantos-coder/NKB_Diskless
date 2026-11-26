@@ -3,8 +3,6 @@ package iscsi_mgmt
 import (
 	"fmt"
 	"log/slog"
-	"os/exec"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -110,29 +108,11 @@ func (tm *TargetManager) ProvisionClientTarget(clientID string) (*ClientBootConf
 		IsSuperClient:  client.IsSuperClient,
 	}
 
-	// Apply kernel target mapping
-	if runtime.GOOS == "windows" {
-		psScript := fmt.Sprintf(`
-			$ErrorActionPreference = 'Stop'
-			if (Get-Command New-IscsiServerTarget -ErrorAction SilentlyContinue) {
-				if (-not (Get-IscsiServerTarget -TargetName '%s' -ErrorAction SilentlyContinue)) {
-					New-IscsiServerTarget -TargetName '%s' -InitiatorIds 'IPAddress:%s'
-				}
-			}
-		`, targetIQN, targetIQN, client.IPAddress)
+	// For Phase 2 PoC: Physical target provisioning via PowerShell/kernel driver is strictly disabled by safety policy.
+	// Target control plane runs entirely in simulated mode to protect host environment.
+	slog.Info("iSCSI Target mapping provisioned in simulated mode (physical PowerShell execution DISABLED_BY_SAFETY_POLICY for Phase 2 PoC)",
+		"client", client.Hostname, "target", targetIQN, "initiator_ip", client.IPAddress)
 
-		cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", psScript)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			slog.Warn("Microsoft iSCSI Target Server PowerShell mapping non-elevated; using simulated control plane",
-				"target", targetIQN, "output", strings.TrimSpace(string(out)))
-		} else {
-			slog.Info("Successfully configured Microsoft iSCSI Target", "target", targetIQN)
-		}
-	}
-
-	slog.Info("Provisioned iSCSI Boot Target",
-		"client", client.Hostname, "iqn", targetIQN, "super", client.IsSuperClient)
 	return bootConfig, nil
 }
 
@@ -148,17 +128,14 @@ func (tm *TargetManager) DeprovisionClientTarget(clientID string) error {
 
 	targetIQN := tm.BuildTargetIQN(client.MACAddress, client.IsSuperClient)
 
-	if runtime.GOOS == "windows" {
-		psScript := fmt.Sprintf(`
-			if (Get-Command Remove-IscsiServerTarget -ErrorAction SilentlyContinue) {
-				Remove-IscsiServerTarget -TargetName '%s' -Force -ErrorAction SilentlyContinue
-			}
-		`, targetIQN)
-		_ = exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", psScript).Run()
-	}
-
-	slog.Info("Deprovisioned iSCSI Target", "client", client.Hostname, "iqn", targetIQN)
+	// For Phase 2 PoC: Physical target removal via PowerShell is disabled by safety policy.
+	slog.Info("Deprovisioned iSCSI Target in simulated mode (physical execution DISABLED_BY_SAFETY_POLICY)", "client", client.Hostname, "iqn", targetIQN)
 	return nil
+}
+
+// CreatePhysicalTarget rejects any request to modify the host iSCSI kernel subsystem during Phase 2 PoC.
+func (tm *TargetManager) CreatePhysicalTarget(targetName string) error {
+	return fmt.Errorf("DISABLED_BY_SAFETY_POLICY: Physical iSCSI target creation is disabled during Phase 2 PoC")
 }
 
 // GenerateNDISRegistryFix produces the registry script required to prevent Windows kernel

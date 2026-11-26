@@ -3,6 +3,7 @@ package storage_mgmt_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"nkb-diskless/internal/config"
@@ -101,5 +102,96 @@ func TestLocalVHDXManagement(t *testing.T) {
 	err = dm.PurgeClientWriteCache(client.ID)
 	if err != nil {
 		t.Fatalf("failed to purge write-cache: %v", err)
+	}
+}
+
+// TestPhysicalDiskSafety_ModificationsBlocked verifies Checkpoint B:
+// All physical disk modification operations are unconditionally rejected with DISABLED_BY_SAFETY_POLICY.
+func TestPhysicalDiskSafety_ModificationsBlocked(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "nkb_physical_disk_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cfg := config.DefaultConfig(tempDir)
+	cfg.DBDriver = "sqlite"
+
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("failed to connect to db: %v", err)
+	}
+	defer db.Close()
+
+	dm, err := storage_mgmt.NewDiskManager(cfg, db)
+	if err != nil {
+		t.Fatalf("failed to create disk manager: %v", err)
+	}
+
+	// 1. Direct call to ModifyPhysicalDisk is rejected
+	err = dm.ModifyPhysicalDisk(0)
+	if err == nil || !strings.Contains(err.Error(), "DISABLED_BY_SAFETY_POLICY") {
+		t.Fatalf("expected ModifyPhysicalDisk to return DISABLED_BY_SAFETY_POLICY, got: %v", err)
+	}
+
+	// 2. Attempting to import raw physical device path is rejected
+	_, err = dm.ImportDisk(`\\.\PhysicalDrive0`, "Raw Drive", "Windows 11")
+	if err == nil || !strings.Contains(err.Error(), "DISABLED_BY_SAFETY_POLICY") {
+		t.Fatalf("expected raw PhysicalDrive path import to return DISABLED_BY_SAFETY_POLICY, got: %v", err)
+	}
+
+	// 3. Attempting to import non-virtual disk file extension is rejected
+	_, err = dm.ImportDisk(filepath.Join(tempDir, "test.exe"), "Executable", "Windows 11")
+	if err == nil || !strings.Contains(err.Error(), "DISABLED_BY_SAFETY_POLICY") {
+		t.Fatalf("expected non-vdisk extension import to return DISABLED_BY_SAFETY_POLICY, got: %v", err)
+	}
+}
+
+// TestCreateVHDX_SanitizationAndInjectionDefense verifies that injection payloads and path traversals in disk names are rejected.
+func TestCreateVHDX_SanitizationAndInjectionDefense(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "nkb_injection_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cfg := config.DefaultConfig(tempDir)
+	cfg.DBDriver = "sqlite"
+
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("failed to connect to db: %v", err)
+	}
+	defer db.Close()
+
+	migrationsDir := filepath.Join("..", "..", "database", "migrations")
+	if err := db.Migrate(migrationsDir); err != nil {
+		t.Fatalf("failed to run migrations: %v", err)
+	}
+
+	dm, err := storage_mgmt.NewDiskManager(cfg, db)
+	if err != nil {
+		t.Fatalf("failed to create disk manager: %v", err)
+	}
+
+	injectionPayloads := []string{
+		`test" maximum=100 type=fixed`,
+		"test\nclean\ncreate vdisk",
+		"../../windows/system32/evil",
+		`..\..\boot.ini`,
+		"name; rm -rf /",
+		"",
+		"   ",
+		"test/disk",
+		"test\\disk",
+		"disk|pipe",
+		"disk`backtick`",
+	}
+
+	for _, payload := range injectionPayloads {
+		_, err := dm.CreateVHDX(payload, 1024*1024*1024, true, "Windows 11", "payload test")
+		if err == nil {
+			t.Errorf("expected payload %q to be rejected, but it succeeded", payload)
+		}
 	}
 }

@@ -3,10 +3,13 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
 	"nkb-diskless/internal/config"
 	"nkb-diskless/internal/database"
@@ -15,6 +18,7 @@ import (
 	"nkb-diskless/internal/services/client_mgmt"
 	"nkb-diskless/internal/services/image_mgmt"
 	"nkb-diskless/internal/services/monitoring"
+	"nkb-diskless/internal/services/network_mgmt"
 	"nkb-diskless/internal/services/pxe_boot"
 	"nkb-diskless/internal/services/storage_mgmt"
 	"nkb-diskless/internal/services/update_manager"
@@ -30,7 +34,12 @@ type Server struct {
 	images    *image_mgmt.ImageService
 	updates   *update_manager.UpdateManager
 	auth      *auth_rbac.AuthService
+	netMgr    *network_mgmt.NetworkConfigManager
+	discovery *network_mgmt.DiscoveryService
+	staging   *network_mgmt.StagingService
+	wsHub     *WSHub
 	mux       *http.ServeMux
+	stopChan  chan struct{}
 }
 
 // NewServer initializes the API router.
@@ -44,6 +53,13 @@ func NewServer(
 	updates *update_manager.UpdateManager,
 	auth *auth_rbac.AuthService,
 ) *Server {
+	hub := NewWSHub()
+	go hub.Run()
+
+	netMgr, _ := network_mgmt.NewNetworkConfigManager(cfg.StorageRoot)
+	disc := network_mgmt.NewDiscoveryService(nil)
+	stag := network_mgmt.NewStagingService(netMgr, disc)
+
 	s := &Server{
 		cfg:       cfg,
 		db:        db,
@@ -53,10 +69,52 @@ func NewServer(
 		images:    images,
 		updates:   updates,
 		auth:      auth,
+		netMgr:    netMgr,
+		discovery: disc,
+		staging:   stag,
+		wsHub:     hub,
 		mux:       http.NewServeMux(),
+		stopChan:  make(chan struct{}),
 	}
 	s.registerRoutes()
+	s.startBackgroundTasks()
 	return s
+}
+
+func (s *Server) Hub() *WSHub {
+	return s.wsHub
+}
+
+func (s *Server) Close() {
+	select {
+	case <-s.stopChan:
+	default:
+		close(s.stopChan)
+	}
+	if s.wsHub != nil {
+		s.wsHub.Stop()
+	}
+}
+
+func (s *Server) startBackgroundTasks() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.stopChan:
+				return
+			case <-ticker.C:
+				count, err := s.db.MarkOfflineStaleClients(15 * time.Second)
+				if err == nil && count > 0 {
+					s.wsHub.Broadcast("workstation.offline", map[string]any{
+						"stale_clients_count": count,
+						"timestamp":           time.Now(),
+					})
+				}
+			}
+		}
+	}()
 }
 
 // Handler returns the HTTP handler with CORS & logging middleware applied.
@@ -64,9 +122,19 @@ func (s *Server) Handler() http.Handler {
 	return s.corsMiddleware(s.mux)
 }
 
+// BootHandler returns a restricted HTTP handler exposing ONLY the /boot/ipxe endpoint.
+// All administrative API routes, management endpoints, and static UI files are strictly omitted
+// from this handler to ensure network clients booting over unencrypted HTTP (port 8080) cannot access control endpoints.
+func (s *Server) BootHandler() http.Handler {
+	bootMux := http.NewServeMux()
+	bootMux.HandleFunc("GET /boot/ipxe", s.handleBootIPXE)
+	return bootMux
+}
+
 func (s *Server) registerRoutes() {
 	// 1. Authentication Endpoints
 	s.mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
+	s.mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
 	s.mux.HandleFunc("GET /api/v1/auth/me", s.auth.RequireAuth(s.handleAuthMe))
 
 	// 2. Workstation Background Agent Protocol
@@ -76,54 +144,84 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/agent/commands/{id}/result", s.auth.RequireAgentToken(s.handleAgentCommandResult))
 
 	// 3. System Telemetry & Health
-	s.mux.HandleFunc("GET /api/v1/system/overview", s.handleSystemOverview)
+	s.mux.HandleFunc("GET /api/v1/ws", s.HandleWebSocket)
+	s.mux.HandleFunc("GET /api/v1/system/overview", s.auth.RequireAuth(s.handleSystemOverview))
 	s.mux.HandleFunc("GET /api/v1/system/health", s.handleHealthCheck)
 
 	// 4. Workstation / Client PC Management
-	s.mux.HandleFunc("GET /api/v1/workstations", s.handleListClients)
-	s.mux.HandleFunc("GET /api/v1/clients", s.handleListClients)
-	s.mux.HandleFunc("POST /api/v1/clients", s.handleCreateClient)
-	s.mux.HandleFunc("GET /api/v1/clients/{id}", s.handleGetClient)
-	s.mux.HandleFunc("PUT /api/v1/clients/{id}", s.handleUpdateClient)
-	s.mux.HandleFunc("DELETE /api/v1/clients/{id}", s.handleDeleteClient)
-	s.mux.HandleFunc("POST /api/v1/clients/{id}/super-client", s.handleToggleSuperClient)
-	s.mux.HandleFunc("POST /api/v1/clients/{id}/reboot", s.handleRebootClient)
-	s.mux.HandleFunc("POST /api/v1/workstations/{id}/command", s.handleQueueCommand)
-	s.mux.HandleFunc("GET /api/v1/workstations/{id}/commands", s.handleListCommands)
-	s.mux.HandleFunc("POST /api/v1/workstations/{id}/wol", s.handleWakeOnLAN)
-	s.mux.HandleFunc("GET /api/v1/workstations/{id}/rdp", s.handleDownloadRDP)
+	s.mux.HandleFunc("GET /api/v1/workstations", s.auth.RequireAuth(s.handleListClients))
+	s.mux.HandleFunc("GET /api/v1/clients", s.auth.RequireAuth(s.handleListClients))
+	s.mux.HandleFunc("POST /api/v1/clients", s.auth.RequireRole("admin", "operator")(s.handleCreateClient))
+	s.mux.HandleFunc("GET /api/v1/clients/{id}", s.auth.RequireAuth(s.handleGetClient))
+	s.mux.HandleFunc("PUT /api/v1/clients/{id}", s.auth.RequireRole("admin", "operator")(s.handleUpdateClient))
+	s.mux.HandleFunc("DELETE /api/v1/clients/{id}", s.auth.RequireRole("admin")(s.handleDeleteClient))
+	s.mux.HandleFunc("POST /api/v1/clients/{id}/super-client", s.auth.RequireRole("admin")(s.handleToggleSuperClient))
+	s.mux.HandleFunc("POST /api/v1/clients/{id}/reboot", s.auth.RequireRole("admin", "operator")(s.handleRebootClient))
+	s.mux.HandleFunc("POST /api/v1/workstations/{id}/command", s.auth.RequireRole("admin", "operator")(s.handleQueueCommand))
+	s.mux.HandleFunc("GET /api/v1/workstations/{id}/commands", s.auth.RequireAuth(s.handleListCommands))
+	s.mux.HandleFunc("POST /api/v1/workstations/{id}/wol", s.auth.RequireRole("admin")(s.handleWakeOnLAN))
+	s.mux.HandleFunc("GET /api/v1/workstations/{id}/rdp", s.auth.RequireAuth(s.handleDownloadRDP))
 
 	// 5. Virtual Disk & Golden Image Management
-	s.mux.HandleFunc("GET /api/v1/disks", s.handleListDisks)
-	s.mux.HandleFunc("POST /api/v1/disks", s.handleCreateDisk)
-	s.mux.HandleFunc("GET /api/v1/disks/{id}", s.handleGetDisk)
-	s.mux.HandleFunc("PUT /api/v1/disks/{id}", s.handleUpdateDisk)
-	s.mux.HandleFunc("DELETE /api/v1/disks/{id}", s.handleDeleteDisk)
-	s.mux.HandleFunc("POST /api/v1/disks/{id}/duplicate", s.handleDuplicateDisk)
-	s.mux.HandleFunc("POST /api/v1/disks/{id}/assign", s.handleAssignDisk)
-	s.mux.HandleFunc("POST /api/v1/workstations/{id}/unassign-disk", s.handleUnassignDisk)
-	s.mux.HandleFunc("GET /api/v1/disks/{id}/versions", s.handleListDiskVersions)
-	s.mux.HandleFunc("POST /api/v1/disks/{id}/rollback", s.handleRollbackDisk)
-	s.mux.HandleFunc("POST /api/v1/disks/{id}/validate", s.handleValidateDisk)
-	s.mux.HandleFunc("POST /api/v1/super-client/commit", s.handleCommitSuperClient)
+	s.mux.HandleFunc("GET /api/v1/disks", s.auth.RequireAuth(s.handleListDisks))
+	s.mux.HandleFunc("POST /api/v1/disks", s.auth.RequireRole("admin")(s.handleCreateDisk))
+	s.mux.HandleFunc("GET /api/v1/disks/{id}", s.auth.RequireAuth(s.handleGetDisk))
+	s.mux.HandleFunc("PUT /api/v1/disks/{id}", s.auth.RequireRole("admin")(s.handleUpdateDisk))
+	s.mux.HandleFunc("DELETE /api/v1/disks/{id}", s.auth.RequireRole("admin")(s.handleDeleteDisk))
+	s.mux.HandleFunc("POST /api/v1/disks/{id}/duplicate", s.auth.RequireRole("admin")(s.handleDuplicateDisk))
+	s.mux.HandleFunc("POST /api/v1/disks/{id}/assign", s.auth.RequireRole("admin")(s.handleAssignDisk))
+	s.mux.HandleFunc("POST /api/v1/workstations/{id}/unassign-disk", s.auth.RequireRole("admin")(s.handleUnassignDisk))
+	s.mux.HandleFunc("GET /api/v1/disks/{id}/versions", s.auth.RequireAuth(s.handleListDiskVersions))
+	s.mux.HandleFunc("POST /api/v1/disks/{id}/rollback", s.auth.RequireRole("admin")(s.handleRollbackDisk))
+	s.mux.HandleFunc("POST /api/v1/disks/{id}/validate", s.auth.RequireRole("admin")(s.handleValidateDisk))
+	s.mux.HandleFunc("POST /api/v1/super-client/commit", s.auth.RequireRole("admin")(s.handleCommitSuperClient))
 
 	// 6. Client Groups
-	s.mux.HandleFunc("GET /api/v1/groups", s.handleListGroups)
-	s.mux.HandleFunc("POST /api/v1/groups", s.handleCreateGroup)
+	s.mux.HandleFunc("GET /api/v1/groups", s.auth.RequireAuth(s.handleListGroups))
+	s.mux.HandleFunc("POST /api/v1/groups", s.auth.RequireRole("admin")(s.handleCreateGroup))
 
 	// 7. Audit Logs
-	s.mux.HandleFunc("GET /api/v1/audit-logs", s.handleListAuditLogs)
+	s.mux.HandleFunc("GET /api/v1/audit-logs", s.auth.RequireRole("admin", "auditor")(s.handleListAuditLogs))
 
 	// 8. Update Management
-	s.mux.HandleFunc("GET /api/v1/updates/version", s.handleGetVersion)
-	s.mux.HandleFunc("POST /api/v1/updates/apply", s.handleApplyUpdate)
+	s.mux.HandleFunc("GET /api/v1/updates/version", s.auth.RequireAuth(s.handleGetVersion))
+	s.mux.HandleFunc("POST /api/v1/updates/apply", s.auth.RequireRole("admin")(s.handleApplyUpdate))
 
-	// 9. PXE Dynamic Boot Endpoint
+	// 9. Hardware & Network Management (Phase 3E & 3E.1)
+	s.mux.HandleFunc("GET /api/v1/network/adapters", s.auth.RequireAuth(s.handleListNetworkAdapters))
+	s.mux.HandleFunc("GET /api/v1/network/profile", s.auth.RequireAuth(s.handleGetNetworkProfile))
+	s.mux.HandleFunc("PUT /api/v1/network/profile", s.auth.RequireRole("admin")(s.handleUpdateNetworkProfile))
+	s.mux.HandleFunc("POST /api/v1/network/adopt", s.auth.RequireRole("admin")(s.handleAdoptAdapter))
+	s.mux.HandleFunc("POST /api/v1/network/validate", s.auth.RequireRole("admin")(s.handleValidateNetwork))
+	s.mux.HandleFunc("POST /api/v1/network/preflight", s.auth.RequireRole("admin")(s.handlePreflightNetwork))
+	s.mux.HandleFunc("POST /api/v1/network/verify", s.auth.RequireRole("admin")(s.handleVerifyNetwork))
+	s.mux.HandleFunc("POST /api/v1/network/rollback", s.auth.RequireRole("admin")(s.handleRollbackNetwork))
+	s.mux.HandleFunc("POST /api/v1/network/rollback/profile", s.auth.RequireRole("admin")(s.handleRollbackProfile))
+	s.mux.HandleFunc("POST /api/v1/network/rollback/windows", s.auth.RequireRole("admin")(s.handleRollbackWindows))
+	s.mux.HandleFunc("GET /api/v1/network/snapshots", s.auth.RequireRole("admin")(s.handleListSnapshots))
+	s.mux.HandleFunc("GET /api/v1/network/scripts/stage", s.auth.RequireRole("admin")(s.handleGetStagingScript))
+	s.mux.HandleFunc("GET /api/v1/network/scripts/rollback", s.auth.RequireRole("admin")(s.handleGetRollbackScript))
+
+	// 10. PXE Dynamic Boot Endpoint
 	s.mux.HandleFunc("GET /boot/ipxe", s.handleBootIPXE)
 
-	// 10. Static UI Serving
-	frontendDist := filepath.Join(s.cfg.StorageRoot, "frontend", "dist")
-	if fi, err := os.Stat(frontendDist); err == nil && fi.IsDir() {
+	// 11. Static UI Serving
+	frontendCandidates := []string{
+		filepath.Join(s.cfg.StorageRoot, "frontend", "dist"),
+		filepath.Join(filepath.Dir(os.Args[0]), "web", "dist"),
+		filepath.Join(filepath.Dir(os.Args[0]), "..", "web", "dist"),
+		filepath.Join(filepath.Dir(os.Args[0]), "..", "frontend", "dist"),
+		filepath.Join("web", "dist"),
+		filepath.Join("frontend", "dist"),
+	}
+	var frontendDist string
+	for _, c := range frontendCandidates {
+		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+			frontendDist = c
+			break
+		}
+	}
+	if frontendDist != "" {
 		fileServer := http.FileServer(http.Dir(frontendDist))
 		s.mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path := filepath.Join(frontendDist, r.URL.Path)
@@ -173,11 +271,33 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	_ = s.db.RecordAudit(&user.ID, user.Username, "AUTH_LOGIN", "user", user.ID, "Administrator logged in", r.RemoteAddr)
 
+	// Set secure HTTP-only session cookie for browser WebSocket & API requests
+	http.SetCookie(w, &http.Cookie{
+		Name:     "nkb_session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  expiresAt,
+	})
+
 	s.jsonResponse(w, http.StatusOK, models.LoginResponse{
 		Token:     token,
 		User:      *user,
 		ExpiresAt: expiresAt.Format("2006-01-02T15:04:05Z07:00"),
 	})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "nkb_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
+	s.jsonResponse(w, http.StatusOK, map[string]string{"status": "logged_out"})
 }
 
 func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
@@ -207,13 +327,29 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		req.IPAddress = ip
 	}
 
+	if req.DeviceToken == "" {
+		req.DeviceToken = r.Header.Get("X-Device-Token")
+	}
+
 	res, err := s.db.RegisterAgent(&req)
 	if err != nil {
-		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		if strings.Contains(err.Error(), "unauthorized") {
+			s.errorResponse(w, http.StatusUnauthorized, err.Error())
+		} else {
+			s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 
 	_ = s.db.RecordAudit(nil, "agent", "AGENT_REGISTER", "client", res.ClientID, fmt.Sprintf("Workstation agent registered: %s (%s)", req.Hostname, req.MACAddress), r.RemoteAddr)
+	s.wsHub.Broadcast("workstation.registered", map[string]any{
+		"client_id":    res.ClientID,
+		"hostname":     req.Hostname,
+		"mac_address":  req.MACAddress,
+		"ip_address":   req.IPAddress,
+		"status":       "online",
+		"device_uuid":  req.DeviceUUID,
+	})
 	s.jsonResponse(w, http.StatusOK, res)
 }
 
@@ -229,6 +365,27 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	s.wsHub.Broadcast("telemetry.updated", map[string]any{
+		"client_id":       client.ID,
+		"status":          "online",
+		"logged_in_user":  req.LoggedInUser,
+		"uptime_seconds":  req.UptimeSec,
+		"cpu_usage_pct":   req.CPUUsagePct,
+		"ram_usage_pct":   req.RAMUsagePct,
+		"ram_total_bytes": req.RAMTotalBytes,
+		"ram_avail_bytes": req.RAMAvailBytes,
+		"disk_usage_pct":  req.DiskUsagePct,
+		"network_rx_mbs":  req.NetworkRxMBs,
+		"network_tx_mbs":  req.NetworkTxMBs,
+		"agent_status":    req.AgentStatus,
+		"last_seen":       time.Now().Format(time.RFC3339),
+	})
+	s.wsHub.Broadcast("workstation.updated", map[string]any{
+		"client_id": client.ID,
+		"status":    "online",
+		"last_seen": time.Now().Format(time.RFC3339),
+	})
 
 	s.jsonResponse(w, http.StatusOK, map[string]string{"status": "acknowledged"})
 }
@@ -264,6 +421,13 @@ func (s *Server) handleAgentCommandResult(w http.ResponseWriter, r *http.Request
 	}
 
 	_ = s.db.RecordAudit(nil, "agent", "COMMAND_RESULT", "command", cmdID, fmt.Sprintf("Command finished with exit code %d", res.ExitCode), r.RemoteAddr)
+	s.wsHub.Broadcast("command.updated", map[string]any{
+		"command_id": cmdID,
+		"client_id":  client.ID,
+		"status":     "completed",
+		"result":     res,
+		"timestamp":  time.Now(),
+	})
 	s.jsonResponse(w, http.StatusOK, map[string]string{"status": "recorded"})
 }
 
@@ -277,15 +441,34 @@ func (s *Server) handleQueueCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	validCommands := map[string]bool{
-		"shutdown":        true,
-		"restart":         true,
-		"lock":            true,
-		"wol":             true,
-		"query_processes": true,
+	disabledCommands := map[string]bool{
+		"shutdown":         true,
+		"force_shutdown":   true,
+		"restart":          true,
+		"reboot":           true,
+		"logoff":           true,
+		"force_logoff":     true,
+		"lock":             true,
+		"lock_workstation": true,
+		"wol":              true,
+		"wake_on_lan":      true,
+		"wake-on-lan":      true,
 	}
-	if !validCommands[strings.ToLower(req.CommandType)] {
-		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("unsupported command type: %s", req.CommandType))
+	cmdLower := strings.ToLower(strings.TrimSpace(req.CommandType))
+	if disabledCommands[cmdLower] {
+		_ = s.db.RecordAudit(nil, "admin", "COMMAND_BLOCKED", "client", clientID, fmt.Sprintf("Command %s rejected: DISABLED_BY_SAFETY_POLICY", req.CommandType), r.RemoteAddr)
+		s.errorResponse(w, http.StatusForbidden, fmt.Sprintf("command '%s' is DISABLED_BY_SAFETY_POLICY", req.CommandType))
+		return
+	}
+
+	allowedCommands := map[string]bool{
+		"query_processes": true,
+		"query_status":    true,
+		"query_health":    true,
+		"query_network":   true,
+	}
+	if !allowedCommands[cmdLower] {
+		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("unsupported or unauthorized command type: %s", req.CommandType))
 		return
 	}
 
@@ -295,9 +478,17 @@ func (s *Server) handleQueueCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var issuerID *string
+	issuerUsername := "admin"
+	if u, ok := r.Context().Value(auth_rbac.UserContextKey).(*models.User); ok && u != nil {
+		issuerID = &u.ID
+		issuerUsername = u.Username
+	}
+
 	cmd := &models.RemoteCommand{
 		ClientID:       clientID,
-		IssuerUsername: "admin",
+		IssuerUserID:   issuerID,
+		IssuerUsername: issuerUsername,
 		CommandType:    strings.ToLower(req.CommandType),
 		Payload:        req.Payload,
 	}
@@ -307,7 +498,15 @@ func (s *Server) handleQueueCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = s.db.RecordAudit(nil, "admin", "COMMAND_QUEUE", "client", clientID, fmt.Sprintf("Queued %s for %s", cmd.CommandType, client.Hostname), r.RemoteAddr)
+	_ = s.db.RecordAudit(issuerID, issuerUsername, "COMMAND_QUEUE", "client", clientID, fmt.Sprintf("Queued %s for %s", cmd.CommandType, client.Hostname), r.RemoteAddr)
+	s.wsHub.Broadcast("command.updated", map[string]any{
+		"command_id":   cmd.ID,
+		"client_id":    clientID,
+		"command_type": cmd.CommandType,
+		"status":       "pending",
+		"command":      cmd,
+		"timestamp":    time.Now(),
+	})
 	s.jsonResponse(w, http.StatusAccepted, cmd)
 }
 
@@ -326,23 +525,8 @@ func (s *Server) handleListCommands(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWakeOnLAN(w http.ResponseWriter, r *http.Request) {
 	clientID := r.PathValue("id")
-	client, err := s.db.GetClientByID(clientID)
-	if err != nil || client == nil {
-		s.errorResponse(w, http.StatusNotFound, "workstation not found")
-		return
-	}
-
-	if err := client_mgmt.SendWakeOnLAN(client.MACAddress, ""); err != nil {
-		s.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("failed to send WOL packet: %v", err))
-		return
-	}
-
-	_ = s.db.RecordAudit(nil, "admin", "WOL_SENT", "client", clientID, fmt.Sprintf("Wake-on-LAN magic packet sent to %s (%s)", client.Hostname, client.MACAddress), r.RemoteAddr)
-	s.jsonResponse(w, http.StatusOK, map[string]string{
-		"status":  "magic_packet_broadcast",
-		"target":  client.MACAddress,
-		"message": fmt.Sprintf("Wake-on-LAN packet dispatched to %s", client.Hostname),
-	})
+	_ = s.db.RecordAudit(nil, "admin", "WOL_BLOCKED", "client", clientID, "Wake-on-LAN request blocked: DISABLED_BY_SAFETY_POLICY for Phase 2 PoC", r.RemoteAddr)
+	s.errorResponse(w, http.StatusForbidden, "Wake-on-LAN is DISABLED_BY_SAFETY_POLICY")
 }
 
 func (s *Server) handleDownloadRDP(w http.ResponseWriter, r *http.Request) {
@@ -361,22 +545,50 @@ func (s *Server) handleDownloadRDP(w http.ResponseWriter, r *http.Request) {
 
 // ----------------- CLIENT / SYSTEM ROUTE HANDLERS -----------------
 
+var validMACRegex = regexp.MustCompile(`^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$|^([0-9A-Fa-f]{12})$`)
+
 func (s *Server) handleBootIPXE(w http.ResponseWriter, r *http.Request) {
-	mac := r.URL.Query().Get("mac")
 	ip := r.RemoteAddr
 	if colon := strings.LastIndex(ip, ":"); colon != -1 {
 		ip = ip[:colon]
 	}
 
+	rawMAC := strings.TrimSpace(r.URL.Query().Get("mac"))
+	if rawMAC == "" {
+		// Default to trial client MAC if omitted
+		rawMAC = "28:00:AF:A8:44:CC"
+	}
+
+	if rawMAC == "" || !validMACRegex.MatchString(rawMAC) {
+		s.errorResponse(w, http.StatusBadRequest, "invalid or missing 'mac' query parameter: must be a valid 6-byte hexadecimal MAC address")
+		return
+	}
+
+	// Normalize MAC address format to AA:BB:CC:DD:EE:FF
+	normalizedMAC := strings.ToUpper(strings.ReplaceAll(rawMAC, "-", ":"))
+	if len(normalizedMAC) == 12 && !strings.Contains(normalizedMAC, ":") {
+		normalizedMAC = fmt.Sprintf("%s:%s:%s:%s:%s:%s",
+			normalizedMAC[0:2], normalizedMAC[2:4], normalizedMAC[4:6],
+			normalizedMAC[6:8], normalizedMAC[8:10], normalizedMAC[10:12])
+	}
+
+	httpPort := s.cfg.HTTPBootPort
+	if httpPort <= 0 {
+		httpPort = s.cfg.APIPort
+	}
+
+	phase3a := s.cfg.Phase3AMode || r.URL.Query().Get("phase") == "3a"
+
 	req := pxe_boot.BootRequest{
-		MAC:         mac,
+		MAC:         normalizedMAC,
 		IP:          ip,
 		Platform:    r.URL.Query().Get("platform"),
 		Arch:        r.URL.Query().Get("arch"),
 		ServerIP:    s.cfg.BindAddress,
-		HTTPPort:    s.cfg.APIPort,
+		HTTPPort:    httpPort,
 		ISCSIPort:   s.cfg.ISCSIPort,
 		ISCSIPrefix: s.cfg.ISCSIIQNPfx,
+		Phase3AMode: phase3a,
 	}
 	if req.ServerIP == "0.0.0.0" {
 		req.ServerIP = r.Host
@@ -386,9 +598,17 @@ func (s *Server) handleBootIPXE(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	slog.Info("iPXE dynamic boot script requested",
+		"mac", normalizedMAC,
+		"client_ip", ip,
+		"platform", req.Platform,
+		"arch", req.Arch,
+		"phase3a", phase3a,
+	)
+
 	script, err := pxe_boot.GenerateScript(req, s.db)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -629,9 +849,8 @@ func (s *Server) handleValidateDisk(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRebootClient(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_ = s.disks.PurgeClientWriteCache(id)
-	_ = s.db.RecordAudit(nil, "admin", "CLIENT_REBOOT", "client", id, "Triggered remote reboot and volatile cache purge", r.RemoteAddr)
-	s.jsonResponse(w, http.StatusOK, map[string]string{"status": "reboot_signaled", "cache": "purged"})
+	_ = s.db.RecordAudit(nil, "admin", "REBOOT_BLOCKED", "client", id, "Remote reboot blocked: DISABLED_BY_SAFETY_POLICY for Phase 2 PoC", r.RemoteAddr)
+	s.errorResponse(w, http.StatusForbidden, "reboot is DISABLED_BY_SAFETY_POLICY")
 }
 
 func (s *Server) handleListDisks(w http.ResponseWriter, r *http.Request) {
@@ -799,6 +1018,269 @@ func (s *Server) handleApplyUpdate(w http.ResponseWriter, r *http.Request) {
 		"result":  "success",
 		"version": payload.Version,
 	})
+}
+
+// ----------------- HARDWARE & NETWORK MANAGEMENT (PHASE 3E) -----------------
+
+func (s *Server) handleListNetworkAdapters(w http.ResponseWriter, r *http.Request) {
+	adapters, err := s.discovery.DiscoverAdapters()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	profile, _ := s.netMgr.LoadProfile()
+	var reconciledStatus string
+	if profile != nil {
+		reconciledStatus, _ = s.netMgr.ReconcileAdapter(profile, adapters)
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]any{
+		"adapters":        adapters,
+		"adopted_adapter": profile.SelectedAdapter,
+		"status":          reconciledStatus,
+		"network_mode":    profile.NetworkMode,
+	})
+}
+
+func (s *Server) handleGetNetworkProfile(w http.ResponseWriter, r *http.Request) {
+	profile, err := s.netMgr.LoadProfile()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	adapters, _ := s.discovery.DiscoverAdapters()
+	if len(adapters) > 0 {
+		s.netMgr.ReconcileAdapter(profile, adapters)
+	}
+	s.jsonResponse(w, http.StatusOK, profile)
+}
+
+func (s *Server) handleUpdateNetworkProfile(w http.ResponseWriter, r *http.Request) {
+	var proposed network_mgmt.NetworkProfile
+	if err := json.NewDecoder(r.Body).Decode(&proposed); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid network profile payload: "+err.Error())
+		return
+	}
+	adapters, _ := s.discovery.DiscoverAdapters()
+	report, err := s.netMgr.ValidateProfile(&proposed, adapters)
+	if err != nil {
+		s.jsonResponse(w, http.StatusBadRequest, map[string]any{
+			"error":     err.Error(),
+			"conflicts": report,
+		})
+		return
+	}
+	if err := s.netMgr.SaveProfile(&proposed); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, proposed)
+}
+
+func (s *Server) handleAdoptAdapter(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		PersistentKey  string `json:"persistent_key"`
+		MACAddress     string `json:"mac_address"`
+		InterfaceAlias string `json:"interface_alias"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid adoption payload")
+		return
+	}
+
+	adapters, err := s.discovery.DiscoverAdapters()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var target *network_mgmt.NetworkAdapter
+	for _, a := range adapters {
+		if (payload.PersistentKey != "" && a.ID == payload.PersistentKey) ||
+			(payload.MACAddress != "" && strings.EqualFold(a.MACAddress, payload.MACAddress)) ||
+			(payload.InterfaceAlias != "" && a.InterfaceAlias == payload.InterfaceAlias) {
+			target = &a
+			break
+		}
+	}
+
+	if target == nil {
+		s.errorResponse(w, http.StatusNotFound, "specified adapter not found on system")
+		return
+	}
+
+	profile, err := s.netMgr.LoadProfile()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if err := s.netMgr.AdoptAdapter(profile, *target); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	report, _ := s.netMgr.ValidateProfile(profile, adapters)
+	preview := s.netMgr.GenerateStagingPreview(profile, target, *report)
+	s.jsonResponse(w, http.StatusOK, map[string]any{
+		"profile": profile,
+		"preview": preview,
+		"status":  "ADOPTED",
+	})
+}
+
+func (s *Server) handleValidateNetwork(w http.ResponseWriter, r *http.Request) {
+	var proposed network_mgmt.NetworkProfile
+	if err := json.NewDecoder(r.Body).Decode(&proposed); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid profile payload")
+		return
+	}
+
+	adapters, err := s.discovery.DiscoverAdapters()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	report, _ := s.netMgr.ValidateProfile(&proposed, adapters)
+	var target *network_mgmt.NetworkAdapter
+	for _, a := range adapters {
+		if (proposed.SelectedAdapter.PersistentKey != "" && a.ID == proposed.SelectedAdapter.PersistentKey) ||
+			(proposed.SelectedAdapter.MAC != "" && strings.EqualFold(a.MACAddress, proposed.SelectedAdapter.MAC)) ||
+			(proposed.SelectedAdapter.Alias != "" && a.InterfaceAlias == proposed.SelectedAdapter.Alias) {
+			target = &a
+			break
+		}
+	}
+	preview := s.netMgr.GenerateStagingPreview(&proposed, target, *report)
+	s.jsonResponse(w, http.StatusOK, preview)
+}
+
+func (s *Server) handleVerifyNetwork(w http.ResponseWriter, r *http.Request) {
+	profile, err := s.netMgr.LoadProfile()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	res, err := s.staging.VerifyLiveConfiguration(profile)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, res)
+}
+
+func (s *Server) handleRollbackNetwork(w http.ResponseWriter, r *http.Request) {
+	restored, err := s.netMgr.Rollback()
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]any{
+		"status":  "ROLLBACK_SUCCESS",
+		"profile": restored,
+	})
+}
+
+func (s *Server) handleGetStagingScript(w http.ResponseWriter, r *http.Request) {
+	profile, err := s.netMgr.LoadProfile()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	script := s.netMgr.GenerateElevatedStagingScript(profile)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(script))
+}
+
+func (s *Server) handlePreflightNetwork(w http.ResponseWriter, r *http.Request) {
+	profile, err := s.netMgr.LoadProfile()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	adapters, err := s.discovery.DiscoverAdapters()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to discover adapters: "+err.Error())
+		return
+	}
+	res, err := s.netMgr.PreflightStaging(profile, adapters)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, res)
+}
+
+func (s *Server) handleRollbackProfile(w http.ResponseWriter, r *http.Request) {
+	restored, err := s.netMgr.RollbackProfile()
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]any{
+		"status":  "PROFILE_ROLLBACK_SUCCESS",
+		"profile": restored,
+	})
+}
+
+func (s *Server) handleRollbackWindows(w http.ResponseWriter, r *http.Request) {
+	profile, err := s.netMgr.LoadProfile()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	snap, err := s.netMgr.GetLatestWindowsSnapshot(profile.SelectedAdapter.PersistentKey)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "No saved Windows network snapshot found: "+err.Error())
+		return
+	}
+	script := s.netMgr.GenerateRollbackScript(snap)
+	s.jsonResponse(w, http.StatusOK, map[string]any{
+		"status":      "ROLLBACK_READY",
+		"snapshot_id": snap.SnapshotID,
+		"adapter":     snap.InterfaceAlias,
+		"script":      script,
+		"command":     "powershell -ExecutionPolicy Bypass -File C:\\NKB-PoC\\config\\scripts\\rollback_adapter.ps1",
+	})
+}
+
+func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
+	snapshots, err := s.netMgr.ListWindowsSnapshots()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]any{
+		"snapshots": snapshots,
+		"total":     len(snapshots),
+	})
+}
+
+func (s *Server) handleGetRollbackScript(w http.ResponseWriter, r *http.Request) {
+	profile, err := s.netMgr.LoadProfile()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	snap, err := s.netMgr.GetLatestWindowsSnapshot(profile.SelectedAdapter.PersistentKey)
+	if err != nil {
+		// If no snapshot exists yet, construct a safe template from current profile
+		adapters, _ := s.discovery.DiscoverAdapters()
+		for _, a := range adapters {
+			if a.ID == profile.SelectedAdapter.PersistentKey || strings.EqualFold(a.MACAddress, profile.SelectedAdapter.MAC) {
+				snap = s.netMgr.BuildSnapshotFromAdapter(&a)
+				break
+			}
+		}
+	}
+	if snap == nil {
+		s.errorResponse(w, http.StatusNotFound, "No adapter snapshot available to generate rollback script")
+		return
+	}
+	script := s.netMgr.GenerateRollbackScript(snap)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(script))
 }
 
 // ----------------- HELPERS -----------------

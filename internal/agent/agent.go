@@ -11,12 +11,15 @@ import (
 	"time"
 
 	"nkb-diskless/internal/models"
+
+	"github.com/google/uuid"
 )
 
 type Agent struct {
 	cfg       *AgentConfig
 	telemetry *TelemetryCollector
 	executor  *CommandExecutor
+	buffer    *ResultBuffer
 	client    *http.Client
 }
 
@@ -24,11 +27,16 @@ func NewAgent(cfg *AgentConfig) *Agent {
 	return &Agent{
 		cfg:       cfg,
 		telemetry: NewTelemetryCollector(),
-		executor:  NewCommandExecutor(),
+		executor:  NewCommandExecutorWithConfig(cfg),
+		buffer:    NewResultBuffer(""),
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
 	}
+}
+
+func (a *Agent) Buffer() *ResultBuffer {
+	return a.buffer
 }
 
 // Run executes the main agent background loop until context cancellation.
@@ -66,13 +74,24 @@ func (a *Agent) Run(ctx context.Context) error {
 func (a *Agent) registerWithServer() error {
 	hostname, _ := os.Hostname()
 	mac := a.telemetry.GetPrimaryMACAddress()
+	macs := a.telemetry.GetMACInventory()
 	ip := a.telemetry.GetLocalIP()
 
+	// Ensure persistent DeviceUUID
+	if a.cfg.DeviceUUID == "" {
+		a.cfg.DeviceUUID = uuid.New().String()
+		_ = a.cfg.Save()
+	}
+
 	reqPayload := models.AgentRegisterRequest{
+		DeviceUUID:   a.cfg.DeviceUUID,
+		DeviceToken:  a.cfg.DeviceToken,
 		MACAddress:   mac,
+		MACInventory: macs,
 		Hostname:     hostname,
 		IPAddress:    ip,
 		OSVersion:    "Windows Workstation",
+		OSBuild:      a.telemetry.GetOSBuild(),
 		HardwareInfo: a.telemetry.CollectHardwareInfo(),
 		AgentVersion: "1.0.0",
 	}
@@ -83,7 +102,16 @@ func (a *Agent) registerWithServer() error {
 	}
 
 	url := fmt.Sprintf("%s/api/v1/agent/register", a.cfg.ServerURL)
-	resp, err := a.client.Post(url, "application/json", bytes.NewBuffer(body))
+	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if a.cfg.DeviceToken != "" {
+		httpReq.Header.Set("X-Device-Token", a.cfg.DeviceToken)
+	}
+
+	resp, err := a.client.Do(httpReq)
 	if err != nil {
 		return err
 	}
@@ -106,13 +134,47 @@ func (a *Agent) registerWithServer() error {
 	return nil
 }
 
+func (a *Agent) flushOfflineResults() {
+	items := a.buffer.GetAll()
+	if len(items) == 0 {
+		return
+	}
+
+	for _, res := range items {
+		resBody, err := json.Marshal(res)
+		if err != nil {
+			continue
+		}
+		urlRes := fmt.Sprintf("%s/api/v1/agent/commands/%s/result", a.cfg.ServerURL, res.CommandID)
+		rReq, err := http.NewRequest("POST", urlRes, bytes.NewBuffer(resBody))
+		if err != nil {
+			continue
+		}
+		rReq.Header.Set("Content-Type", "application/json")
+		rReq.Header.Set("X-Device-Token", a.cfg.DeviceToken)
+
+		rResp, err := a.client.Do(rReq)
+		if err == nil {
+			if rResp.StatusCode == http.StatusOK || rResp.StatusCode == http.StatusCreated {
+				_ = a.buffer.Remove(res.CommandID)
+				slog.Info("Successfully flushed offline command result to server", "command_id", res.CommandID)
+			}
+			_ = rResp.Body.Close()
+		}
+	}
+}
+
 func (a *Agent) heartbeatAndPoll() {
+	// 0. Flush any offline results if server is now reachable
+	a.flushOfflineResults()
+
 	// 1. Send Telemetry Heartbeat
 	hbReq, err := a.telemetry.SampleHeartbeat(a.cfg.DeviceToken)
 	if err != nil {
 		slog.Warn("Failed to sample telemetry", "err", err)
 		return
 	}
+	hbReq.DeviceUUID = a.cfg.DeviceUUID
 
 	body, err := json.Marshal(hbReq)
 	if err == nil {
@@ -154,7 +216,10 @@ func (a *Agent) heartbeatAndPoll() {
 		slog.Info("Executing authorized command", "command_type", cmd.CommandType, "id", cmd.ID)
 		res := a.executor.ExecuteAuthorizedCommand(&cmd)
 
-		// Report result
+		// Enqueue locally first to guarantee persistence against network failure
+		_ = a.buffer.Enqueue(res)
+
+		// Attempt immediate delivery
 		resBody, err := json.Marshal(res)
 		if err == nil {
 			urlRes := fmt.Sprintf("%s/api/v1/agent/commands/%s/result", a.cfg.ServerURL, cmd.ID)
@@ -162,6 +227,9 @@ func (a *Agent) heartbeatAndPoll() {
 			rReq.Header.Set("Content-Type", "application/json")
 			rReq.Header.Set("X-Device-Token", a.cfg.DeviceToken)
 			if rResp, err := a.client.Do(rReq); err == nil {
+				if rResp.StatusCode == http.StatusOK || rResp.StatusCode == http.StatusCreated {
+					_ = a.buffer.Remove(cmd.ID)
+				}
 				_ = rResp.Body.Close()
 			}
 		}

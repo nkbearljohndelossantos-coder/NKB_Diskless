@@ -100,4 +100,10 @@ func TestISCSITargetManagement(t *testing.T) {
 	if err := mgr.DeprovisionClientTarget(client.ID); err != nil {
 		t.Fatalf("failed to deprovision target: %v", err)
 	}
+
+	// 7. Checkpoint C: Test that real physical target management returns DISABLED_BY_SAFETY_POLICY
+	err = mgr.CreatePhysicalTarget("real-target-prohibited")
+	if err == nil || !strings.Contains(err.Error(), "DISABLED_BY_SAFETY_POLICY") {
+		t.Fatalf("expected CreatePhysicalTarget to return DISABLED_BY_SAFETY_POLICY, got: %v", err)
+	}
 }

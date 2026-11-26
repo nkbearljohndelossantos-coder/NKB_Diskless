@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -85,22 +86,108 @@ func (s *AuthService) ValidateToken(tokenStr string) (*Claims, error) {
 	return nil, errors.New("invalid token")
 }
 
-// RequireAuth middleware verifies administrator JWT from Authorization: Bearer <token>.
+// validateCSRF ensures cross-origin state-changing requests cannot be forged via session cookies.
+func validateCSRF(r *http.Request) bool {
+	// Block explicit cross-site fetch metadata
+	fetchSite := r.Header.Get("Sec-Fetch-Site")
+	if fetchSite == "cross-site" {
+		return false
+	}
+	if fetchSite == "same-origin" || fetchSite == "same-site" {
+		return true
+	}
+
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		// Match against r.Host
+		if strings.EqualFold(u.Host, r.Host) {
+			return true
+		}
+		// Allow local dev frontend origins
+		uHost := u.Hostname()
+		rHost := r.Host
+		if strings.Contains(rHost, ":") {
+			rHost = strings.Split(rHost, ":")[0]
+		}
+		isULocal := uHost == "localhost" || uHost == "127.0.0.1" || uHost == "::1"
+		isRLocal := rHost == "localhost" || rHost == "127.0.0.1" || rHost == "::1"
+		if isULocal && isRLocal {
+			uPort := u.Port()
+			if uPort == "5173" || uPort == "3000" {
+				return true
+			}
+		}
+		return false
+	}
+
+	referer := r.Header.Get("Referer")
+	if referer != "" {
+		u, err := url.Parse(referer)
+		if err != nil {
+			return false
+		}
+		if strings.EqualFold(u.Host, r.Host) {
+			return true
+		}
+		uHost := u.Hostname()
+		rHost := r.Host
+		if strings.Contains(rHost, ":") {
+			rHost = strings.Split(rHost, ":")[0]
+		}
+		isULocal := uHost == "localhost" || uHost == "127.0.0.1" || uHost == "::1"
+		isRLocal := rHost == "localhost" || rHost == "127.0.0.1" || rHost == "::1"
+		if isULocal && isRLocal {
+			uPort := u.Port()
+			if uPort == "5173" || uPort == "3000" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Fail closed if state-changing cookie request lacks Origin, Referer, and Sec-Fetch-Site
+	return false
+}
+
+// RequireAuth middleware verifies administrator JWT from Authorization: Bearer <token> or secure cookie.
 func (s *AuthService) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		var tokenStr string
+		var isCookieAuth bool
+
 		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			http.Error(w, `{"error":"authorization header required"}`, http.StatusUnauthorized)
+		if authHeader != "" {
+			parts := strings.Split(authHeader, " ")
+			if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
+				tokenStr = parts[1]
+			}
+		}
+
+		if tokenStr == "" {
+			if cookie, err := r.Cookie("nkb_session"); err == nil && cookie.Value != "" {
+				tokenStr = cookie.Value
+				isCookieAuth = true
+			}
+		}
+
+		if tokenStr == "" {
+			http.Error(w, `{"error":"authorization header or session cookie required"}`, http.StatusUnauthorized)
 			return
 		}
 
-		parts := strings.Split(authHeader, " ")
-		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			http.Error(w, `{"error":"invalid authorization format; use Bearer <token>"}`, http.StatusUnauthorized)
-			return
+		// CSRF Protection for state-changing operations authenticated via cookie
+		if isCookieAuth && (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete || r.Method == http.MethodPatch) {
+			if !validateCSRF(r) {
+				http.Error(w, `{"error":"forbidden: cross-site request forgery protection rejected request"}`, http.StatusForbidden)
+				return
+			}
 		}
 
-		claims, err := s.ValidateToken(parts[1])
+		claims, err := s.ValidateToken(tokenStr)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"unauthorized: %s"}`, err.Error()), http.StatusUnauthorized)
 			return

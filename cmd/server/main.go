@@ -19,7 +19,6 @@ import (
 	"nkb-diskless/internal/services/auth_rbac"
 	"nkb-diskless/internal/services/image_mgmt"
 	"nkb-diskless/internal/services/monitoring"
-	"nkb-diskless/internal/services/pxe_boot"
 	"nkb-diskless/internal/services/storage_mgmt"
 	"nkb-diskless/internal/services/update_manager"
 )
@@ -67,7 +66,21 @@ func main() {
 	defer db.Close()
 
 	// 2. Run Database Migrations
-	migrationsDir := filepath.Join(absBase, "internal", "database", "migrations")
+	candidateMigrationDirs := []string{
+		filepath.Join(absBase, "internal", "database", "migrations"),
+		filepath.Join(filepath.Dir(os.Args[0]), "migrations"),
+		filepath.Join(filepath.Dir(os.Args[0]), "..", "migrations"),
+		filepath.Join(filepath.Dir(os.Args[0]), "..", "internal", "database", "migrations"),
+		filepath.Join("internal", "database", "migrations"),
+		filepath.Join("migrations"),
+	}
+	var migrationsDir string
+	for _, dir := range candidateMigrationDirs {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			migrationsDir = dir
+			break
+		}
+	}
 	if err := db.Migrate(migrationsDir); err != nil {
 		slog.Error("Failed to run schema migrations", "err", err)
 		os.Exit(1)
@@ -110,24 +123,12 @@ func main() {
 	authService := auth_rbac.NewAuthService(cfg.JWTSecret, db, cfg.TokenExpiration)
 
 	// 4. Start Network Boot Infrastructure
-	// TFTP Service (Optional / Configurable)
+	// Strict Phase 2 Safety Policy: Network boot daemon listeners (TFTP/ProxyDHCP) remain permanently disabled.
 	if cfg.EnableTFTP {
-		tftpServer := pxe_boot.NewTFTPServer(cfg.TFTPBootDir, cfg.TFTPPort)
-		if err := tftpServer.Start(); err != nil {
-			slog.Warn("Could not bind TFTP port (may require admin privileges on UDP 69)", "err", err)
-		} else {
-			defer tftpServer.Stop()
-		}
+		slog.Warn("TFTP daemon listener is DISABLED_BY_SAFETY_POLICY for Phase 2 PoC; deferred to Phase 3 isolated test network")
 	}
-
-	// ProxyDHCP Service (Optional / Configurable)
 	if cfg.EnableProxyDHCP {
-		proxyDHCP := pxe_boot.NewProxyDHCPServer(cfg.BindAddress, cfg.ProxyDHCPPort)
-		if err := proxyDHCP.Start(); err != nil {
-			slog.Warn("Could not bind ProxyDHCP port (UDP 4011)", "err", err)
-		} else {
-			defer proxyDHCP.Stop()
-		}
+		slog.Warn("ProxyDHCP daemon listener is DISABLED_BY_SAFETY_POLICY for Phase 2 PoC; deferred to Phase 3 isolated test network")
 	}
 
 	// 5. Initialize API Server
@@ -148,6 +149,24 @@ func main() {
 		}
 	}()
 
+	// Launch dedicated HTTP Boot Server if explicitly enabled and configured on a separate port (e.g. port 8080)
+	var bootServer *http.Server
+	if cfg.EnableHTTPBoot && cfg.HTTPBootPort > 0 && cfg.HTTPBootPort != cfg.APIPort {
+		bootServer = &http.Server{
+			Addr:         fmt.Sprintf("%s:%d", cfg.BindAddress, cfg.HTTPBootPort),
+			Handler:      apiServer.BootHandler(),
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+		go func() {
+			slog.Info("NKB HTTP Boot Service live", "address", fmt.Sprintf("http://%s:%d", cfg.BindAddress, cfg.HTTPBootPort))
+			if err := bootServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("HTTP Boot Server error", "err", err)
+			}
+		}()
+	}
+
 	// 6. Graceful Shutdown on OS Signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -157,6 +176,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	if bootServer != nil {
+		_ = bootServer.Shutdown(ctx)
+	}
 	if err := httpServer.Shutdown(ctx); err != nil {
 		slog.Error("Server forced shutdown", "err", err)
 	}

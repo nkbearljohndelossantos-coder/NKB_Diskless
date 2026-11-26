@@ -35,25 +35,49 @@ func (t *TelemetryCollector) GetPrimaryMACAddress() string {
 			continue
 		}
 		name := strings.ToLower(iface.Name)
-		if strings.Contains(name, "vEthernet") || strings.Contains(name, "pseudo") || strings.Contains(name, "virtual") {
+		if strings.Contains(name, "vethernet") || strings.Contains(name, "pseudo") || strings.Contains(name, "virtual") {
 			continue
 		}
 
-		mac := iface.HardwareAddr.String()
+		mac := strings.ToUpper(iface.HardwareAddr.String())
 		if len(mac) == 17 {
-			return strings.ToUpper(mac)
+			return mac
 		}
 	}
 
 	// Fallback to first non-empty MAC
 	for _, iface := range interfaces {
-		mac := iface.HardwareAddr.String()
-		if len(mac) == 17 {
-			return strings.ToUpper(mac)
+		mac := strings.ToUpper(iface.HardwareAddr.String())
+		if len(mac) == 17 && mac != "00:00:00:00:00:00" {
+			return mac
 		}
 	}
 
 	return "00:00:00:00:00:00"
+}
+
+// GetMACInventory enumerates all physical and virtual network interfaces.
+func (t *TelemetryCollector) GetMACInventory() []string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return []string{}
+	}
+
+	seen := make(map[string]bool)
+	var macs []string
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		mac := strings.ToUpper(strings.ReplaceAll(iface.HardwareAddr.String(), "-", ":"))
+		if len(mac) == 17 && mac != "00:00:00:00:00:00" && !seen[mac] {
+			seen[mac] = true
+			macs = append(macs, mac)
+		}
+	}
+
+	return macs
 }
 
 // GetLocalIP returns the primary IPv4 address of this workstation.
@@ -76,6 +100,18 @@ func (t *TelemetryCollector) GetLoggedInUser() string {
 	return user
 }
 
+// GetOSBuild returns the OS kernel / platform build version.
+func (t *TelemetryCollector) GetOSBuild() string {
+	hInfo, err := host.Info()
+	if err == nil && hInfo != nil {
+		if hInfo.KernelVersion != "" {
+			return hInfo.KernelVersion
+		}
+		return hInfo.PlatformVersion
+	}
+	return runtime.GOOS
+}
+
 // CollectHardwareInfo produces a JSON payload detailing the workstation hardware specs.
 func (t *TelemetryCollector) CollectHardwareInfo() string {
 	hInfo, _ := host.Info()
@@ -88,20 +124,27 @@ func (t *TelemetryCollector) CollectHardwareInfo() string {
 	}
 
 	var ramMB int64
+	var ramBytes int64
 	if vMem != nil {
 		ramMB = int64(vMem.Total / (1024 * 1024))
+		ramBytes = int64(vMem.Total)
 	}
 
 	platform := runtime.GOOS
+	var osBuild string
 	if hInfo != nil {
 		platform = hInfo.Platform + " " + hInfo.PlatformVersion
+		osBuild = hInfo.KernelVersion
 	}
 
 	specs := map[string]any{
-		"cpu":         cpuModel,
-		"ram_mb":      ramMB,
-		"os_platform": platform,
-		"arch":        runtime.GOARCH,
+		"cpu":            cpuModel,
+		"ram_mb":         ramMB,
+		"ram_total_bytes": ramBytes,
+		"os_platform":    platform,
+		"os_build":       osBuild,
+		"arch":           runtime.GOARCH,
+		"mac_inventory":  t.GetMACInventory(),
 	}
 
 	bytes, _ := json.Marshal(specs)
@@ -132,6 +175,8 @@ func (t *TelemetryCollector) SampleHeartbeat(deviceToken string) (*models.AgentH
 	vMem, err := mem.VirtualMemory()
 	if err == nil {
 		req.RAMUsagePct = float32(vMem.UsedPercent)
+		req.RAMTotalBytes = int64(vMem.Total)
+		req.RAMAvailBytes = int64(vMem.Available)
 	}
 
 	// Disk (System Drive)

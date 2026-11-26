@@ -18,10 +18,50 @@ type BootRequest struct {
 	HTTPPort    int
 	ISCSIPort   int
 	ISCSIPrefix string
+	Phase3AMode bool // Safety enforcement for Phase 3A isolated test
+}
+
+// GeneratePhase3AScript produces a safe, read-only diagnostic iPXE script for Phase 3A verification.
+// CRITICAL SAFETY POLICY: Under NO circumstances may this script execute sanboot, sanhook,
+// attach iSCSI targets, chainload operating systems, or modify any client storage.
+func GeneratePhase3AScript(req BootRequest) string {
+	macNorm := strings.ToUpper(strings.ReplaceAll(req.MAC, "-", ":"))
+	return fmt.Sprintf(`#!ipxe
+echo ========================================================
+echo  NKB DISKLESS PLATFORM - PHASE 3A PXE TEST
+echo ========================================================
+echo Client MAC: %s
+echo Client IP:  %s
+echo Platform:   %s
+echo Arch:       %s
+echo Server IP:  %s
+echo HTTP Port:  %d
+echo ========================================================
+echo [PHASE 3A] iPXE chainloading and script retrieval successful.
+echo [PHASE 3A] Safe diagnostic mode active - NO DISKS ATTACHED.
+echo [PHASE 3A] Network boot verification passed.
+echo ========================================================
+echo
+prompt --key 0x02 --timeout 15000 Press Ctrl-B for the iPXE command line or wait to reboot... || goto reboot_node
+
+:shell_prompt
+shell
+goto reboot_node
+
+:reboot_node
+echo Rebooting system in 5 seconds...
+sleep 5
+reboot
+`, macNorm, req.IP, req.Platform, req.Arch, req.ServerIP, req.HTTPPort)
 }
 
 // GenerateScript produces the dynamic iPXE configuration script based on client state in NKB database.
 func GenerateScript(req BootRequest, db *database.DB) (string, error) {
+	// If Phase 3A Safe Mode is requested or active, strictly serve non-destructive diagnostic script
+	if req.Phase3AMode {
+		return GeneratePhase3AScript(req), nil
+	}
+
 	macNorm := strings.ToUpper(strings.ReplaceAll(req.MAC, "-", ":"))
 	client, err := db.GetClientByMAC(macNorm)
 	if err != nil {
@@ -100,10 +140,30 @@ echo  Write-Cache Mode: %s
 echo ========================================================
 set keep-san 1
 set net0/gateway 0.0.0.0
-echo Connecting to NKB Virtual Block SAN...
+
+menu NKB Boot Selection
+item --default direct  1. Boot Windows 11 (Diskless iSCSI)
+item winpe             2. Windows 11 Network Installer (WinPE)
+item shell             3. iPXE Command Shell
+choose --timeout 10000 --default direct target_mode && goto ${target_mode}
+
+:direct
+echo Connecting to NKB Virtual Block SAN and Booting Windows...
+sanboot iscsi:%s::::%s || goto san_fail
+
+:winpe
+echo Connecting SAN device for setup...
 sanhook iscsi:%s::::%s || goto san_fail
-echo Booting Windows Operating System from SAN...
-sanboot --no-describe iscsi:%s::::%s || goto san_fail
+echo Loading Windows 11 Network Installer via wimboot...
+kernel http://%s:8080/wimboot
+initrd http://%s:8080/winpe/bootmgr bootmgr
+initrd http://%s:8080/winpe/boot/bcd BCD
+initrd http://%s:8080/winpe/boot/boot.sdi boot.sdi
+initrd http://%s:8080/winpe/sources/boot.wim boot.wim
+boot
+
+:shell
+shell
 
 :san_fail
 echo [FATAL] SAN connection failed to target: %s
@@ -113,6 +173,7 @@ reboot
 `, client.Hostname, client.MACAddress, diskName, client.WriteCacheMode,
 		req.ServerIP, targetIQN,
 		req.ServerIP, targetIQN,
+		req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP,
 		targetIQN)
 }
 

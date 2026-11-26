@@ -20,7 +20,9 @@ type Server struct {
 // Client represents a workstation managed by NKB (local or diskless).
 type Client struct {
 	ID                  string     `json:"id" db:"id"`
+	DeviceUUID          string     `json:"device_uuid,omitempty" db:"device_uuid"`
 	MACAddress          string     `json:"mac_address" db:"mac_address"` // e.g. 00:11:22:33:44:55
+	MACInventory        string     `json:"mac_inventory,omitempty" db:"mac_inventory"` // JSON array of MAC addresses
 	IPAddress           string     `json:"ip_address" db:"ip_address"`
 	Hostname            string     `json:"hostname" db:"hostname"`
 	GroupID             *string    `json:"group_id,omitempty" db:"group_id"`
@@ -31,6 +33,9 @@ type Client struct {
 	BootMode            string     `json:"boot_mode" db:"boot_mode"` // UEFI, BIOS
 	WriteCacheMode      string     `json:"write_cache_mode" db:"write_cache_mode"` // inherited, volatile, persistent
 	HardwareInfo        string     `json:"hardware_info" db:"hardware_info"` // JSON: CPU, RAM, GPU, NIC, Disk, OS
+	RAMTotalBytes       int64      `json:"ram_total_bytes,omitempty" db:"ram_total_bytes"`
+	RAMAvailBytes       int64      `json:"ram_avail_bytes,omitempty" db:"ram_avail_bytes"`
+	OSBuild             string     `json:"os_build,omitempty" db:"os_build"`
 	LastBootTime        *time.Time `json:"last_boot_time,omitempty" db:"last_boot_time"`
 	LastSeen            *time.Time `json:"last_seen,omitempty" db:"last_seen"`
 	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
@@ -233,12 +238,17 @@ type LoginResponse struct {
 }
 
 type AgentRegisterRequest struct {
-	MACAddress   string `json:"mac_address"`
-	Hostname     string `json:"hostname"`
-	IPAddress    string `json:"ip_address"`
-	OSVersion    string `json:"os_version"`
-	HardwareInfo string `json:"hardware_info"` // JSON string
-	AgentVersion string `json:"agent_version"`
+	DeviceUUID    string   `json:"device_uuid,omitempty"`
+	DeviceToken   string   `json:"device_token,omitempty"`
+	MACAddress    string   `json:"mac_address"`
+	MACInventory  []string `json:"mac_inventory,omitempty"`
+	Hostname      string   `json:"hostname"`
+	IPAddress     string   `json:"ip_address"`
+	OSVersion     string   `json:"os_version"`
+	OSBuild       string   `json:"os_build,omitempty"`
+	HardwareInfo  string   `json:"hardware_info"` // JSON string
+	AgentVersion  string   `json:"agent_version"`
+	TotalRAMBytes int64    `json:"total_ram_bytes,omitempty"`
 }
 
 type AgentRegisterResponse struct {
@@ -248,11 +258,14 @@ type AgentRegisterResponse struct {
 }
 
 type AgentHeartbeatRequest struct {
+	DeviceUUID   string  `json:"device_uuid,omitempty"`
 	DeviceToken  string  `json:"device_token"`
 	LoggedInUser string  `json:"logged_in_user"`
 	UptimeSec    int64   `json:"uptime_seconds"`
 	CPUUsagePct  float32 `json:"cpu_usage_pct"`
 	RAMUsagePct  float32 `json:"ram_usage_pct"`
+	RAMTotalBytes int64  `json:"ram_total_bytes,omitempty"`
+	RAMAvailBytes int64  `json:"ram_avail_bytes,omitempty"`
 	DiskUsagePct float32 `json:"disk_usage_pct"`
 	NetworkRxMBs float32 `json:"network_rx_mbs"`
 	NetworkTxMBs float32 `json:"network_tx_mbs"`

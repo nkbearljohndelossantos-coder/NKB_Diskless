@@ -1,0 +1,71 @@
+﻿{
+    "product_name":  "NKB Diskless System",
+    "version":  "1.0.0",
+    "build_date":  "2026-11-24T12:50:23Z",
+    "target_platform":  "Windows 11 Pro",
+    "architecture":  "x64",
+    "installer_type":  "Inno Setup Executable (PE32+)",
+    "installer_file":  "NKB-Diskless-System-Setup-x64.exe",
+    "installer_size_bytes":  32496141,
+    "installer_sha256":  "959741BE825317DD177BED9BD9CEA60E25D0C78A0ABCCB63ADC5AB0F1D8C561A",
+    "components":  [
+                       {
+                           "name":  "nkb-server",
+                           "role":  "Core Backend API \u0026 Boot Server",
+                           "path":  "bin/nkb-server.exe"
+                       },
+                       {
+                           "name":  "nkb-agent",
+                           "role":  "Workstation Client Agent",
+                           "path":  "bin/nkb-agent.exe"
+                       },
+                       {
+                           "name":  "nkb-discover",
+                           "role":  "Hardware Discovery Engine",
+                           "path":  "bin/nkb-discover.exe"
+                       },
+                       {
+                           "name":  "nkb-desktop-manager",
+                           "role":  "Desktop GUI Console",
+                           "path":  "bin/nkb-desktop-manager.exe"
+                       },
+                       {
+                           "name":  "web-dashboard",
+                           "role":  "React Management SPA",
+                           "path":  "web/dist/"
+                       },
+                       {
+                           "name":  "bios-bootloader",
+                           "role":  "iPXE BIOS Bootloader",
+                           "path":  "tftpboot/bios/undionly.kpxe"
+                       },
+                       {
+                           "name":  "uefi-bootloader",
+                           "role":  "iPXE UEFI Bootloader",
+                           "path":  "tftpboot/uefi/ipxe.efi"
+                       },
+                       {
+                           "name":  "hardware-onboarding",
+                           "role":  "Hardware-Independent Setup Wizard",
+                           "path":  "config/scripts/first-run-setup.ps1"
+                       },
+                       {
+                           "name":  "firewall-config",
+                           "role":  "Firewall Rule Manager",
+                           "path":  "config/scripts/configure-firewall.ps1"
+                       },
+                       {
+                           "name":  "service-manager",
+                           "role":  "Windows Service Controller",
+                           "path":  "config/scripts/install-service.ps1"
+                       }
+                   ],
+    "safety_guarantees":  {
+                              "network_mutation_on_install":  "NONE (Disabled by default)",
+                              "pxe_listeners_on_install":  "NONE (Stopped by default)",
+                              "firewall_rules":  "Explicit Opt-in Component",
+                              "windows_service":  "Explicit Opt-in (Manual Startup Only)",
+                              "hardware_independence":  "VERIFIED (Zero hardcoded MAC/IP/Index)",
+                              "data_preservation":  "VERIFIED (User storage preserved on uninstall)"
+                          }
+}

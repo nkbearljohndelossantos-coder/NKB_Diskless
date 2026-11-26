@@ -34,8 +34,10 @@ import {
   Play,
   Check,
   X,
-  Users
+  Users,
+  LogOut
 } from 'lucide-react';
+import NetworkManagement from './components/NetworkManagement';
 
 interface SystemOverview {
   server_hostname: string;
@@ -175,6 +177,7 @@ export default function App() {
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [diskVersions, setDiskVersions] = useState<{ [diskId: string]: DiskVersion[] }>({});
   const [theme, setTheme] = useState<'dark' | 'light'>('light');
+  const [wsConnected, setWsConnected] = useState<boolean>(false);
 
   // Search & Filter State
   const [searchQuery, setSearchQuery] = useState('');
@@ -203,15 +206,69 @@ export default function App() {
 
   // Update manager state
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [installedVersion, setInstalledVersion] = useState<string>('v1.0.0');
+  const [updateLoading, setUpdateLoading] = useState<boolean>(false);
+
+  // Authentication State
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(true);
+  const [loginUsername, setLoginUsername] = useState('admin');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [currentUser, setCurrentUser] = useState<{ id?: string; username: string; role: string } | null>(null);
 
   const showNotification = (msg: string) => {
     setActionNotice(msg);
     setTimeout(() => setActionNotice(null), 4000);
   };
 
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsLoggingIn(true);
+    setLoginError(null);
+    try {
+      const res = await fetch('/api/v1/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: loginUsername, password: loginPassword })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setIsAuthenticated(true);
+        setCurrentUser(data.user || { username: loginUsername, role: 'admin' });
+        setLoginPassword('');
+        fetchOverview();
+        fetchClients();
+        fetchDisks();
+        fetchGroups();
+        fetchAuditLogs();
+      } else {
+        setLoginError(data.error || 'Authentication failed');
+      }
+    } catch (err: any) {
+      setLoginError(err.message || 'Network error connecting to management server');
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/v1/auth/logout', { method: 'POST' });
+    } catch (e) {
+      console.error(e);
+    }
+    setIsAuthenticated(false);
+    setCurrentUser(null);
+  };
+
   const fetchOverview = async () => {
     try {
       const res = await fetch('/api/v1/system/overview');
+      if (res.status === 401) {
+        setIsAuthenticated(false);
+        return;
+      }
       if (res.ok) setOverview(await res.json());
     } catch (e) {
       console.error(e);
@@ -226,6 +283,10 @@ export default function App() {
       if (selectedStatus) params.append('status', selectedStatus);
 
       const res = await fetch(`/api/v1/workstations?${params.toString()}`);
+      if (res.status === 401) {
+        setIsAuthenticated(false);
+        return;
+      }
       if (res.ok) setClients(await res.json());
     } catch (e) {
       console.error(e);
@@ -235,6 +296,10 @@ export default function App() {
   const fetchDisks = async () => {
     try {
       const res = await fetch('/api/v1/disks');
+      if (res.status === 401) {
+        setIsAuthenticated(false);
+        return;
+      }
       if (res.ok) {
         const data: VirtualDisk[] = await res.json();
         setDisks(data);
@@ -248,6 +313,10 @@ export default function App() {
   const fetchVersions = async (diskId: string) => {
     try {
       const res = await fetch(`/api/v1/disks/${diskId}/versions`);
+      if (res.status === 401) {
+        setIsAuthenticated(false);
+        return;
+      }
       if (res.ok) {
         const versions: DiskVersion[] = await res.json();
         setDiskVersions(prev => ({ ...prev, [diskId]: versions }));
@@ -260,6 +329,10 @@ export default function App() {
   const fetchGroups = async () => {
     try {
       const res = await fetch('/api/v1/groups');
+      if (res.status === 401) {
+        setIsAuthenticated(false);
+        return;
+      }
       if (res.ok) setGroups(await res.json());
     } catch (e) {
       console.error(e);
@@ -269,6 +342,10 @@ export default function App() {
   const fetchAuditLogs = async () => {
     try {
       const res = await fetch('/api/v1/audit-logs');
+      if (res.status === 401) {
+        setIsAuthenticated(false);
+        return;
+      }
       if (res.ok) setAuditLogs(await res.json());
     } catch (e) {
       console.error(e);
@@ -278,7 +355,25 @@ export default function App() {
   const fetchCommandHistory = async (clientId: string) => {
     try {
       const res = await fetch(`/api/v1/workstations/${clientId}/commands`);
+      if (res.status === 401) {
+        setIsAuthenticated(false);
+        return;
+      }
       if (res.ok) setCommandHistory(await res.json());
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const fetchVersion = async () => {
+    try {
+      const res = await fetch('/api/v1/updates/version');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.current_version) {
+          setInstalledVersion(data.current_version);
+        }
+      }
     } catch (e) {
       console.error(e);
     }
@@ -290,6 +385,7 @@ export default function App() {
     fetchDisks();
     fetchGroups();
     fetchAuditLogs();
+    fetchVersion();
 
     const interval = setInterval(() => {
       fetchOverview();
@@ -297,6 +393,88 @@ export default function App() {
     }, 3000);
     return () => clearInterval(interval);
   }, [activeTab, searchQuery, selectedGroup, selectedStatus]);
+
+  // WebSocket Live Telemetry Connection
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let reconnectTimer: any = null;
+    let isUnmounted = false;
+
+    const connectWS = () => {
+      try {
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.location.host || 'localhost:8443';
+        const url = `${proto}//${host}/api/v1/ws`;
+
+        ws = new WebSocket(url);
+
+        ws.onopen = () => {
+          if (!isUnmounted) setWsConnected(true);
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const lines = event.data.split('\n');
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              const data = JSON.parse(line);
+              if (data.type === 'telemetry.updated') {
+                const tel = data.payload;
+                setClients(prev => prev.map(c => {
+                  if (c.id === tel.client_id) {
+                    return {
+                      ...c,
+                      status: 'online',
+                      logged_in_user: tel.logged_in_user || c.logged_in_user,
+                      uptime_seconds: tel.uptime_seconds ?? c.uptime_seconds,
+                      cpu_usage_pct: tel.cpu_usage_pct ?? c.cpu_usage_pct,
+                      ram_usage_pct: tel.ram_usage_pct ?? c.ram_usage_pct,
+                      agent_status: tel.agent_status || c.agent_status,
+                      last_seen: tel.last_seen || new Date().toISOString()
+                    };
+                  }
+                  return c;
+                }));
+              } else if (data.type === 'workstation.registered' || data.type === 'workstation.updated' || data.type === 'workstation.offline') {
+                fetchClients();
+                fetchOverview();
+              } else if (data.type === 'command.updated') {
+                if (selectedClientForRemote) {
+                  fetchCommandHistory(selectedClientForRemote.id);
+                }
+              }
+            }
+          } catch (e) {
+            console.error('Error parsing WS message', e);
+          }
+        };
+
+        ws.onclose = () => {
+          if (!isUnmounted) {
+            setWsConnected(false);
+            reconnectTimer = setTimeout(connectWS, 3000);
+          }
+        };
+
+        ws.onerror = () => {
+          if (ws) ws.close();
+        };
+      } catch (e) {
+        if (!isUnmounted) {
+          setWsConnected(false);
+          reconnectTimer = setTimeout(connectWS, 5000);
+        }
+      }
+    };
+
+    connectWS();
+
+    return () => {
+      isUnmounted = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (ws) ws.close();
+    };
+  }, [selectedClientForRemote]);
 
   // Handlers
   const handleCreateClient = async (e: React.FormEvent) => {
@@ -321,9 +499,13 @@ export default function App() {
         fetchClients();
         fetchOverview();
         showNotification(`Workstation ${newClient.hostname} successfully registered.`);
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Registration failed' }));
+        showNotification(`Registration Error: ${err.error || 'Failed to register client'}`);
       }
     } catch (e) {
       console.error(e);
+      showNotification('Network error while registering workstation.');
     }
   };
 
@@ -346,9 +528,13 @@ export default function App() {
         setNewDisk({ name: '', size_gb: 50, format: 'VHDX', os_type: 'Windows 11 Pro x64', description: '' });
         fetchDisks();
         showNotification(`Virtual Disk ${newDisk.name} created.`);
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Creation failed' }));
+        showNotification(`Disk Creation Error: ${err.error || 'Failed to create disk'}`);
       }
     } catch (e) {
       console.error(e);
+      showNotification('Network error while creating virtual disk.');
     }
   };
 
@@ -367,9 +553,14 @@ export default function App() {
           fetchCommandHistory(clientId);
         }
         showNotification(`Dispatched remote command [${commandType.toUpperCase()}] to workstation.`);
+      } else {
+        setConfirmAction(null);
+        const err = await res.json().catch(() => ({ error: 'Command rejected' }));
+        showNotification(`Command Error: ${err.error || 'Failed to dispatch command'}`);
       }
     } catch (e) {
       console.error(e);
+      showNotification('Network error while dispatching command.');
     }
   };
 
@@ -379,9 +570,13 @@ export default function App() {
       if (res.ok) {
         showNotification(`Wake-on-LAN magic packet sent to ${hostname}.`);
         fetchAuditLogs();
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Operation rejected' }));
+        showNotification(`Wake-on-LAN Blocked: ${err.error || 'DISABLED_BY_SAFETY_POLICY'}`);
       }
     } catch (e) {
       console.error(e);
+      showNotification('Network error while sending Wake-on-LAN.');
     }
   };
 
@@ -456,9 +651,13 @@ export default function App() {
         fetchDisks();
         fetchAuditLogs();
         showNotification('Virtual disk successfully assigned to workstation.');
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Assignment failed' }));
+        showNotification(`Assignment Error: ${err.error || 'Failed to assign disk'}`);
       }
     } catch (e) {
       console.error(e);
+      showNotification('Network error while assigning disk.');
     }
   };
 
@@ -469,9 +668,13 @@ export default function App() {
       if (res.ok) {
         fetchClients();
         showNotification('Workstation unassigned from disk.');
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Unassign failed' }));
+        showNotification(`Unassign Error: ${err.error || 'Failed to unassign disk'}`);
       }
     } catch (e) {
       console.error(e);
+      showNotification('Network error while unassigning disk.');
     }
   };
 
@@ -510,23 +713,35 @@ export default function App() {
 
   const handleRebootClient = async (clientId: string) => {
     try {
-      await fetch(`/api/v1/clients/${clientId}/reboot`, { method: 'POST' });
-      fetchClients();
-      showNotification('Triggered remote reboot and volatile write-cache purge.');
+      const res = await fetch(`/api/v1/clients/${clientId}/reboot`, { method: 'POST' });
+      if (res.ok) {
+        fetchClients();
+        showNotification('Triggered remote reboot and volatile write-cache purge.');
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Operation rejected' }));
+        showNotification(`Remote Reboot Blocked: ${err.error || 'DISABLED_BY_SAFETY_POLICY'}`);
+      }
     } catch (e) {
       console.error(e);
+      showNotification('Network error executing reboot command.');
     }
   };
 
   const handleDeleteClient = async (clientId: string) => {
     if (!confirm('Are you sure you want to remove this client from NKB Diskless management?')) return;
     try {
-      await fetch(`/api/v1/clients/${clientId}`, { method: 'DELETE' });
-      fetchClients();
-      fetchOverview();
-      showNotification('Workstation removed from management.');
+      const res = await fetch(`/api/v1/clients/${clientId}`, { method: 'DELETE' });
+      if (res.ok) {
+        fetchClients();
+        fetchOverview();
+        showNotification('Workstation removed from management.');
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Delete failed' }));
+        showNotification(`Delete Error: ${err.error || 'Failed to remove workstation'}`);
+      }
     } catch (e) {
       console.error(e);
+      showNotification('Network error while removing workstation.');
     }
   };
 
@@ -542,9 +757,41 @@ export default function App() {
       if (res.ok) {
         fetchDisks();
         showNotification(`Cloned disk to ${newName}.`);
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Cloning failed' }));
+        showNotification(`Clone Error: ${err.error || 'Failed to duplicate disk'}`);
       }
     } catch (e) {
       console.error(e);
+      showNotification('Network error while cloning disk.');
+    }
+  };
+
+  const handleApplyUpgrade = async () => {
+    setUpdateLoading(true);
+    setUpdateStatus('Applying update: 1. Taking pre-update DB snapshot... 2. Migrating schema...');
+    try {
+      const res = await fetch('/api/v1/updates/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: '1.1.0' })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setUpdateStatus(`Update successfully applied! System running version ${data.version || '1.1.0'}.`);
+        fetchVersion();
+        fetchAuditLogs();
+        showNotification('Platform update successfully verified and applied.');
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Update failed' }));
+        setUpdateStatus(`Update Failed: ${err.error || 'Upgrade failed'}`);
+        showNotification(`Update Failed: ${err.error || 'Upgrade failed'}`);
+      }
+    } catch (e) {
+      setUpdateStatus('Update failed: Network connection error.');
+      showNotification('Update failed: Network connection error.');
+    } finally {
+      setUpdateLoading(false);
     }
   };
 
@@ -566,6 +813,93 @@ export default function App() {
     return `${mins}m`;
   };
 
+  if (!isAuthenticated) {
+    return (
+      <div className={`min-h-screen flex items-center justify-center p-4 font-sans ${theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'bg-slate-100 text-slate-900'}`}>
+        <div className={`w-full max-w-md p-8 rounded-xl border shadow-2xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center gap-3">
+              <img src="/nkb-logo.png" alt="NKB Logo" className="w-12 h-12 object-contain rounded-lg shadow-md" />
+              <div>
+                <h1 className="text-base font-bold tracking-wide">DISKLESS SYSTEM</h1>
+                <p className="text-xs text-slate-400 font-medium">Enterprise Management Platform</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              className="text-slate-400 hover:text-white p-1 rounded"
+              title="Toggle Theme"
+            >
+              {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            </button>
+          </div>
+
+          <div className="mb-6">
+            <h2 className="text-base font-semibold text-slate-800 dark:text-slate-100">Administrator Sign In</h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Authenticate to manage workstations, virtual disks, and network boot infrastructure.</p>
+          </div>
+
+          {loginError && (
+            <div className="mb-4 p-3 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800 text-xs text-red-600 dark:text-red-400 flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>{loginError}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Username</label>
+              <input
+                type="text"
+                value={loginUsername}
+                onChange={(e) => setLoginUsername(e.target.value)}
+                required
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900 dark:text-slate-100"
+                placeholder="admin"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Password</label>
+              <input
+                type="password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                required
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900 dark:text-slate-100"
+                placeholder="••••••••"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={isLoggingIn}
+              className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-semibold rounded-lg shadow transition flex items-center justify-center gap-2"
+            >
+              {isLoggingIn ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  <span>Authenticating...</span>
+                </>
+              ) : (
+                <>
+                  <Lock className="w-4 h-4" />
+                  <span>Sign In to Platform</span>
+                </>
+              )}
+            </button>
+          </form>
+
+          <div className="mt-6 pt-4 border-t border-slate-200 dark:border-slate-800 text-center">
+            <p className="text-[11px] text-slate-400 font-mono">
+              Role-Based Access Control • Session Encrypted (HTTPS/Cookie)
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`flex h-screen font-sans ${theme === 'dark' ? 'bg-slate-900 text-slate-100' : 'bg-slate-100 text-slate-900'}`}>
       {/* 1. Sidebar - Dark Navy Enterprise Palette */}
@@ -574,9 +908,7 @@ export default function App() {
           {/* Brand Header */}
           <div className="p-5 border-b border-slate-800 flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="w-9 h-9 bg-blue-600 rounded flex items-center justify-center font-bold text-white text-lg tracking-wider shadow">
-                NKB
-              </div>
+              <img src="/nkb-logo.png" alt="NKB Logo" className="w-10 h-10 object-contain rounded shadow" />
               <div>
                 <h1 className="text-white font-bold text-sm tracking-wide">DISKLESS</h1>
                 <p className="text-slate-400 text-xs font-medium">Enterprise Platform</p>
@@ -736,7 +1068,7 @@ export default function App() {
                   }`}
                 >
                   <Network className="w-4 h-4 shrink-0" />
-                  <span>Network Monitor</span>
+                  <span>Hardware & Network</span>
                 </button>
               </div>
             </div>
@@ -823,6 +1155,14 @@ export default function App() {
           )}
 
           <div className="flex items-center gap-4 text-xs font-mono text-slate-500 dark:text-slate-400">
+            <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-sans font-medium border transition-colors ${
+              wsConnected
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-300 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-700'
+                : 'bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-950/60 dark:text-amber-300 dark:border-amber-700'
+            }`}>
+              <span className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`}></span>
+              <span>{wsConnected ? 'Live WS Telemetry' : 'HTTP Polling (3s)'}</span>
+            </div>
             {overview && (
               <>
                 <span>CPU: {overview.cpu_usage_pct.toFixed(0)}%</span>
@@ -832,6 +1172,18 @@ export default function App() {
                 <span>SAN: {overview.active_iscsi_sessions} sessions</span>
               </>
             )}
+            <div className="flex items-center gap-2 pl-3 border-l border-slate-200 dark:border-slate-800">
+              <span className="text-xs font-sans font-medium text-slate-700 dark:text-slate-300">
+                {currentUser ? `${currentUser.username} (${currentUser.role})` : 'admin'}
+              </span>
+              <button
+                onClick={handleLogout}
+                className="p-1 rounded text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"
+                title="Sign Out"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            </div>
           </div>
         </header>
 
@@ -1271,6 +1623,11 @@ export default function App() {
                     </div>
                   </div>
                 ))}
+                {disks.length === 0 && (
+                  <div className="col-span-full p-8 text-center text-slate-400 border rounded-lg border-dashed text-xs">
+                    No virtual disks created yet. Click "Create Virtual Disk" to initialize a golden VHDX image.
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1682,40 +2039,13 @@ reboot`}
             </div>
           )}
 
-          {/* TAB 12: NETWORK MONITOR */}
+          {/* TAB 12: HARDWARE & NETWORK MANAGEMENT (PHASE 3E) */}
           {activeTab === 'network' && (
-            <div className="space-y-6">
-              <div>
-                <h3 className="text-sm font-bold">Network Boot & SAN Throughput Monitor</h3>
-                <p className="text-xs text-slate-500">Real-time interface telemetry, packet delivery metrics, and isolated VLAN 99 status.</p>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div className={`p-5 rounded-lg border ${theme === 'dark' ? 'bg-slate-800/60 border-slate-700' : 'bg-white border-slate-200'}`}>
-                  <span className="text-xs text-slate-400 font-medium">INTERFACE TX (OUT)</span>
-                  <div className="mt-2 text-2xl font-bold font-mono text-blue-600">
-                    {overview ? overview.network_tx_mbs.toFixed(1) : 0} MB/s
-                  </div>
-                  <p className="text-[11px] text-slate-400 mt-1">1 Gbps NIC Link Speed</p>
-                </div>
-
-                <div className={`p-5 rounded-lg border ${theme === 'dark' ? 'bg-slate-800/60 border-slate-700' : 'bg-white border-slate-200'}`}>
-                  <span className="text-xs text-slate-400 font-medium">INTERFACE RX (IN)</span>
-                  <div className="mt-2 text-2xl font-bold font-mono text-emerald-600">
-                    {overview ? overview.network_rx_mbs.toFixed(1) : 0} MB/s
-                  </div>
-                  <p className="text-[11px] text-slate-400 mt-1">Client differential write traffic</p>
-                </div>
-
-                <div className={`p-5 rounded-lg border ${theme === 'dark' ? 'bg-slate-800/60 border-slate-700' : 'bg-white border-slate-200'}`}>
-                  <span className="text-xs text-slate-400 font-medium">LACP BONDING STATUS</span>
-                  <div className="mt-2 text-base font-bold font-mono text-slate-700 dark:text-slate-300">
-                    802.3ad Multi-Client
-                  </div>
-                  <p className="text-[11px] text-slate-400 mt-1">Single-flow cap: 1.0 Gbps per client</p>
-                </div>
-              </div>
-            </div>
+            <NetworkManagement
+              theme={theme}
+              showNotification={showNotification}
+              overview={overview}
+            />
           )}
 
           {/* TAB 13: HARDWARE MONITOR */}
@@ -1747,6 +2077,11 @@ reboot`}
                     </div>
                   </div>
                 ))}
+                {clients.length === 0 && (
+                  <div className="col-span-full p-8 text-center text-slate-400 border rounded-lg border-dashed text-xs">
+                    No hardware inventory reported yet. Workstation telemetry will appear when agents report heartbeats.
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1771,6 +2106,11 @@ reboot`}
                     </div>
                   </div>
                 ))}
+                {groups.length === 0 && (
+                  <div className="col-span-full p-8 text-center text-slate-400 border rounded-lg border-dashed text-xs">
+                    No department groups defined yet.
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1830,7 +2170,7 @@ reboot`}
               <div className={`p-6 rounded-lg border max-w-xl space-y-4 ${theme === 'dark' ? 'bg-slate-800/60 border-slate-700' : 'bg-white border-slate-200'}`}>
                 <div className="flex justify-between items-center">
                   <span className="text-xs text-slate-500">Installed Version:</span>
-                  <span className="font-mono font-bold text-sm">v1.0.0-PROPOSAL</span>
+                  <span className="font-mono font-bold text-sm">{installedVersion}</span>
                 </div>
                 <div className="flex justify-between items-center">
                   <span className="text-xs text-slate-500">Target Upgrade:</span>
@@ -1840,13 +2180,11 @@ reboot`}
                   All updates automatically perform a full database snapshot before migration. Rollback is supported without data loss.
                 </div>
                 <button
-                  onClick={() => {
-                    setUpdateStatus('Applying update: 1. Taking DB backup... 2. Migrating schema... 3. Success!');
-                    showNotification('Update verification simulated successfully.');
-                  }}
-                  className="w-full py-2.5 bg-blue-600 text-white rounded text-xs font-semibold hover:bg-blue-700 shadow"
+                  onClick={handleApplyUpgrade}
+                  disabled={updateLoading}
+                  className="w-full py-2.5 bg-blue-600 disabled:bg-blue-400 text-white rounded text-xs font-semibold hover:bg-blue-700 shadow"
                 >
-                  Verify & Apply Upgrade
+                  {updateLoading ? 'Applying Upgrade & Pre-Update Snapshot...' : 'Verify & Apply Upgrade'}
                 </button>
                 {updateStatus && (
                   <p className="text-xs font-mono text-emerald-600 mt-2">{updateStatus}</p>
@@ -1866,12 +2204,20 @@ reboot`}
               <div className={`p-6 rounded-lg border max-w-2xl space-y-4 ${theme === 'dark' ? 'bg-slate-800/60 border-slate-700' : 'bg-white border-slate-200'}`}>
                 <div className="grid grid-cols-2 gap-4 text-xs">
                   <div>
-                    <label className="font-semibold text-slate-500 block mb-1">Server API Port</label>
-                    <input type="text" readOnly value="8080" className="w-full p-2 border rounded font-mono bg-slate-50 dark:bg-slate-800" />
+                    <label className="font-semibold text-slate-500 block mb-1">Server Hostname</label>
+                    <input type="text" readOnly value={overview?.server_hostname || 'NKB-SERVER-01'} className="w-full p-2 border rounded font-mono bg-slate-50 dark:bg-slate-800" />
+                  </div>
+                  <div>
+                    <label className="font-semibold text-slate-500 block mb-1">Platform Architecture</label>
+                    <input type="text" readOnly value="Windows 11 Pro Zero-Purchase PoC" className="w-full p-2 border rounded font-mono bg-slate-50 dark:bg-slate-800" />
                   </div>
                   <div>
                     <label className="font-semibold text-slate-500 block mb-1">Database Engine</label>
-                    <input type="text" readOnly value="SQLite3 (PostgreSQL-Ready)" className="w-full p-2 border rounded font-mono bg-slate-50 dark:bg-slate-800" />
+                    <input type="text" readOnly value="SQLite3 (PostgreSQL-Ready Dual Mode)" className="w-full p-2 border rounded font-mono bg-slate-50 dark:bg-slate-800" />
+                  </div>
+                  <div>
+                    <label className="font-semibold text-slate-500 block mb-1">Dedicated Test Subnet</label>
+                    <input type="text" readOnly value="192.168.50.0/24 (Air-Gapped)" className="w-full p-2 border rounded font-mono bg-slate-50 dark:bg-slate-800" />
                   </div>
                   <div>
                     <label className="font-semibold text-slate-500 block mb-1">TFTP Storage Root</label>

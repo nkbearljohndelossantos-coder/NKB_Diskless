@@ -5,7 +5,8 @@ bin/
 *.dll
 *.so
 *.dylib
-dist/
+dist/staging/
+!dist/installer/
 build/
 
 # Go dependency and test artifacts
@@ -16,7 +17,8 @@ vendor/
 # Node dependencies and frontend builds
 node_modules/
 .npm
-frontend/dist/
+frontend/dist/staging/
+!dist/installer/
 frontend/.env.local
 frontend/.env.*.local
 
@@ -51,3 +53,10 @@ temp/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Temporary archives and scratch
+*.zip
+*.bak
+scratch/
+*.txt
+

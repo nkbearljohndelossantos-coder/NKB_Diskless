@@ -1,23 +1,30 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Config represents all runtime settings for the NKB Diskless System.
 type Config struct {
 	// Server identity & binding
-	ServerID       string `json:"server_id"`
-	Hostname       string `json:"hostname"`
-	BindAddress    string `json:"bind_address"`
-	APIPort        int    `json:"api_port"`
-	HTTPBootPort   int    `json:"http_boot_port"`
-	TFTPPort       int    `json:"tftp_port"`
-	ProxyDHCPPort  int    `json:"proxy_dhcp_port"`
+	ServerID        string `json:"server_id"`
+	Hostname        string `json:"hostname"`
+	BindAddress     string `json:"bind_address"`
+	APIPort         int    `json:"api_port"`
+	HTTPBootPort    int    `json:"http_boot_port"`
+	TFTPPort        int    `json:"tftp_port"`
+	ProxyDHCPPort   int    `json:"proxy_dhcp_port"`
 	EnableProxyDHCP bool   `json:"enable_proxy_dhcp"`
-	EnableTFTP     bool   `json:"enable_tftp"`
+	EnableTFTP      bool   `json:"enable_tftp"`
+	EnableHTTPBoot  bool   `json:"enable_http_boot"`
+	Phase3AMode     bool   `json:"phase3a_mode"`
 
 	// Storage and image repositories (Default: C:\NKB-PoC)
 	StorageRoot     string `json:"storage_root"`
@@ -45,10 +52,10 @@ type Config struct {
 	TokenExpiration int    `json:"token_expiration_hours"` // in hours
 
 	// iSCSI Configuration
-	ISCSIIQNPfx  string `json:"iscsi_iqn_prefix"`
-	ISCSIPortal  string `json:"iscsi_portal"`
-	ISCSIPort    int    `json:"iscsi_port"`
-	EnableCHAP   bool   `json:"enable_chap"`
+	ISCSIIQNPfx string `json:"iscsi_iqn_prefix"`
+	ISCSIPortal string `json:"iscsi_portal"`
+	ISCSIPort   int    `json:"iscsi_port"`
+	EnableCHAP  bool   `json:"enable_chap"`
 
 	// Environment
 	Environment string `json:"environment"` // "development", "staging", "production"
@@ -84,8 +91,10 @@ func DefaultConfig(baseDir string) *Config {
 		HTTPBootPort:    8080,
 		TFTPPort:        69,
 		ProxyDHCPPort:   4011,
-		EnableProxyDHCP: true,
-		EnableTFTP:      true,
+		EnableProxyDHCP: false,
+		EnableTFTP:      false,
+		EnableHTTPBoot:  false,
+		Phase3AMode:     true, // Default to safe diagnostic Phase 3A mode
 
 		StorageRoot:     baseDir,
 		AppDir:          appDir,
@@ -116,6 +125,27 @@ func DefaultConfig(baseDir string) *Config {
 
 		Environment: "development",
 	}
+}
+
+// Validate checks for configuration inconsistencies and safety requirements.
+func (cfg *Config) Validate() error {
+	if cfg.APIPort <= 0 || cfg.APIPort > 65535 {
+		return fmt.Errorf("invalid api_port: %d", cfg.APIPort)
+	}
+
+	// When network boot services are enabled, strict non-wildcard binding is required
+	if cfg.EnableProxyDHCP || cfg.EnableTFTP {
+		trimmed := strings.TrimSpace(cfg.BindAddress)
+		if trimmed == "" || trimmed == "0.0.0.0" || trimmed == "::" {
+			return errors.New("network boot services (ProxyDHCP/TFTP) cannot be enabled on a wildcard (0.0.0.0) or empty bind address; an explicit dedicated test NIC IP must be configured")
+		}
+		ip := net.ParseIP(trimmed)
+		if ip == nil || ip.IsUnspecified() || ip.To4() == nil {
+			return fmt.Errorf("network boot services require a valid non-wildcard IPv4 bind address, got: %q", cfg.BindAddress)
+		}
+	}
+
+	return nil
 }
 
 // EnsureStorageLayout creates the directory hierarchy according to NKB data protection standards.
@@ -167,8 +197,46 @@ func LoadConfig(configPath string, baseDir string) (*Config, error) {
 		return nil, err
 	}
 
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, err
+	}
+
+	// Also parse nested configuration blocks if present (from first-run setup wizard)
+	var nested struct {
+		HTTPBoot *struct {
+			Enabled *bool `json:"enabled"`
+			Port    int   `json:"port"`
+		} `json:"http_boot"`
+		TFTP *struct {
+			Enabled *bool `json:"enabled"`
+			Port    int   `json:"port"`
+		} `json:"tftp"`
+		DHCP *struct {
+			Enabled *bool `json:"enabled"`
+		} `json:"dhcp"`
+	}
+	if err := json.Unmarshal(data, &nested); err == nil {
+		if nested.HTTPBoot != nil {
+			if nested.HTTPBoot.Enabled != nil {
+				cfg.EnableHTTPBoot = *nested.HTTPBoot.Enabled
+			}
+			if nested.HTTPBoot.Port > 0 {
+				cfg.HTTPBootPort = nested.HTTPBoot.Port
+			}
+		}
+		if nested.TFTP != nil {
+			if nested.TFTP.Enabled != nil {
+				cfg.EnableTFTP = *nested.TFTP.Enabled
+			}
+			if nested.TFTP.Port > 0 {
+				cfg.TFTPPort = nested.TFTP.Port
+			}
+		}
+		if nested.DHCP != nil && nested.DHCP.Enabled != nil {
+			cfg.EnableProxyDHCP = *nested.DHCP.Enabled
+		}
 	}
 
 	return cfg, nil

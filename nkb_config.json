@@ -6,8 +6,8 @@
   "http_boot_port": 8080,
   "tftp_port": 69,
   "proxy_dhcp_port": 4011,
-  "enable_proxy_dhcp": true,
-  "enable_tftp": true,
+  "enable_proxy_dhcp": false,
+  "enable_tftp": false,
   "storage_root": "C:\\Users\\earlj\\Desktop\\NKB Diskless System Management",
   "disks_dir": "C:\\Users\\earlj\\Desktop\\NKB Diskless System Management\\disks",
   "cache_dir": "C:\\Users\\earlj\\Desktop\\NKB Diskless System Management\\cache",
@@ -21,5 +21,6 @@
   "iscsi_portal": "0.0.0.0",
   "iscsi_port": 3260,
   "enable_chap": false,
+  "phase3a_mode": false,
   "environment": "development"
 }

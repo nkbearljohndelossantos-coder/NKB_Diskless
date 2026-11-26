@@ -83,12 +83,9 @@ func (a *App) LaunchRemoteDesktop(hostname string, ip string) string {
 	return "RDP session launched"
 }
 
-// SendWakeOnLAN broadcasts a magic packet directly from desktop manager
+// SendWakeOnLAN is permanently disabled by NKB safety policy
 func (a *App) SendWakeOnLAN(mac string) string {
-	if err := client_mgmt.SendWakeOnLAN(mac, ""); err != nil {
-		return fmt.Sprintf("WOL error: %v", err)
-	}
-	return fmt.Sprintf("Magic packet dispatched to %s", mac)
+	return "WOL error: DISABLED_BY_SAFETY_POLICY: Wake-on-LAN is permanently disabled by safety policy"
 }
 
 // OpenStorageFolder opens Explorer to specified path

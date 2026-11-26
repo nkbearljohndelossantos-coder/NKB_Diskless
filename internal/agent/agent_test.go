@@ -66,15 +66,15 @@ func TestCommandExecutorWhitelist(t *testing.T) {
 		t.Fatalf("expected process list JSON in output, got: %s", res.Output)
 	}
 
-	// 2. Authorized Safe Command: wol qualification
+	// 2. Disabled Command for Safety: wol must be blocked by safety policy
 	wolCmd := &models.RemoteCommand{
 		ID:          "cmd-02",
 		ClientID:    "client-01",
 		CommandType: "wol",
 	}
 	wolRes := executor.ExecuteAuthorizedCommand(wolCmd)
-	if wolRes.ExitCode != 0 {
-		t.Fatalf("expected exit code 0 for wol, got %d", wolRes.ExitCode)
+	if wolRes.ExitCode != 1 || !strings.Contains(wolRes.ErrorMessage, "DISABLED_BY_SAFETY_POLICY") {
+		t.Fatalf("expected exit code 1 with DISABLED_BY_SAFETY_POLICY for wol, got exit=%d err=%s", wolRes.ExitCode, wolRes.ErrorMessage)
 	}
 
 	// 3. Unauthorized Dangerous Command must be strictly rejected
@@ -87,7 +87,7 @@ func TestCommandExecutorWhitelist(t *testing.T) {
 	if dangerRes.ExitCode == 0 {
 		t.Fatalf("expected non-zero exit code for unauthorized command")
 	}
-	if !strings.Contains(dangerRes.ErrorMessage, "unauthorized command rejected") {
-		t.Fatalf("expected rejection error message, got: %s", dangerRes.ErrorMessage)
+	if !strings.Contains(dangerRes.ErrorMessage, "not in the safe command whitelist") {
+		t.Fatalf("expected whitelist rejection error message, got: %s", dangerRes.ErrorMessage)
 	}
 }

@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "profile_id": "profile_default",
+  "profile_name": "NKB Zero-Purchase Isolated Staging",
+  "network_mode": "isolated_standalone",
+  "selected_adapter": {
+    "persistent_key": "nic_5d3c49ebbf96602b",
+    "alias": "Ethernet",
+    "description": "Realtek Gaming GbE Family Controller",
+    "index": 8,
+    "guid": "",
+    "mac": "B0-0C-D1-E6-53-31"
+  },
+  "ipv4_config": {
+    "ip_address": "192.168.50.1",
+    "prefix_length": 24,
+    "default_gateway": "",
+    "dns_servers": []
+  },
+  "dhcp_config": {
+    "enabled": true,
+    "pool_start": "192.168.50.100",
+    "pool_end": "192.168.50.200",
+    "lease_duration_seconds": 120,
+    "subnet_mask": "255.255.255.0"
+  },
+  "pxe_config": {
+    "enable_standalone_dhcp": false,
+    "enable_proxy_dhcp": false,
+    "enable_tftp": false,
+    "enable_http_boot": true,
+    "tftp_port": 69,
+    "proxy_dhcp_port": 4011,
+    "http_boot_port": 8080,
+    "bios_bootloader": "bios/undionly.kpxe",
+    "uefi_bootloader": "uefi/ipxe.efi"
+  },
+  "storage_root": "C:\\Users\\earlj\\Desktop\\NKB Diskless System Management",
+  "status": "SELECTED",
+  "last_verification": "NOT_TESTED",
+  "last_updated_at": "2026-11-23T15:54:30.1024885Z"
+}
