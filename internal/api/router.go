@@ -191,6 +191,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/network/adapters", s.auth.RequireAuth(s.handleListNetworkAdapters))
 	s.mux.HandleFunc("GET /api/v1/network/profile", s.auth.RequireAuth(s.handleGetNetworkProfile))
 	s.mux.HandleFunc("PUT /api/v1/network/profile", s.auth.RequireRole("admin")(s.handleUpdateNetworkProfile))
+	s.mux.HandleFunc("POST /api/v1/network/profile", s.auth.RequireRole("admin")(s.handleUpdateNetworkProfile))
 	s.mux.HandleFunc("POST /api/v1/network/adopt", s.auth.RequireRole("admin")(s.handleAdoptAdapter))
 	s.mux.HandleFunc("POST /api/v1/network/validate", s.auth.RequireRole("admin")(s.handleValidateNetwork))
 	s.mux.HandleFunc("POST /api/v1/network/preflight", s.auth.RequireRole("admin")(s.handlePreflightNetwork))
@@ -1275,7 +1276,8 @@ func (s *Server) handleGetRollbackScript(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	if snap == nil {
-		s.errorResponse(w, http.StatusNotFound, "No adapter snapshot available to generate rollback script")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("# No adapter rollback snapshot recorded yet.\n# Rollback script will be dynamically generated once an adapter is staged.\n"))
 		return
 	}
 	script := s.netMgr.GenerateRollbackScript(snap)

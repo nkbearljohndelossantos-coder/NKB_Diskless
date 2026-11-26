@@ -95,10 +95,12 @@ type AdapterMatch struct {
 
 // IPv4Config defines the target IP parameters for the dedicated server interface.
 type IPv4Config struct {
-	IPAddress      string   `json:"ip_address"`      // e.g. "192.168.50.1"
-	PrefixLength   int      `json:"prefix_length"`   // e.g. 24
-	DefaultGateway string   `json:"default_gateway"` // optional (empty in airgap)
-	DNSServers     []string `json:"dns_servers"`     // optional (empty in airgap)
+	IPAddress      string   `json:"ip_address"`                // e.g. "192.168.50.1"
+	ServerIP       string   `json:"server_ip,omitempty"`       // alias for frontend compatibility
+	PrefixLength   int      `json:"prefix_length"`             // e.g. 24
+	SubnetMask     string   `json:"subnet_mask,omitempty"`     // e.g. "255.255.255.0"
+	DefaultGateway string   `json:"default_gateway"`           // optional (empty in airgap)
+	DNSServers     []string `json:"dns_servers"`               // optional (empty in airgap)
 }
 
 // DHCPConfig defines the IP leasing parameters for standalone DHCP mode.
@@ -106,11 +108,12 @@ type IPv4Config struct {
 // Runtime activation of the UDP 67 daemon is separately controlled by PXEConfig.EnableStandaloneDHCP.
 type DHCPConfig struct {
 	Enabled              bool   `json:"enabled"`
-	PoolConfigured       bool   `json:"pool_configured"`        // Explicit flag: leasing pool definition is active
-	PoolStart            string `json:"pool_start"`             // e.g. "192.168.50.100"
-	PoolEnd              string `json:"pool_end"`               // e.g. "192.168.50.200"
-	LeaseDurationSeconds int    `json:"lease_duration_seconds"` // e.g. 120 or 7200
-	SubnetMask           string `json:"subnet_mask"`            // e.g. "255.255.255.0"
+	PoolConfigured       bool   `json:"pool_configured"`                  // Explicit flag: leasing pool definition is active
+	PoolStart            string `json:"pool_start"`                       // e.g. "192.168.50.100"
+	PoolEnd              string `json:"pool_end"`                         // e.g. "192.168.50.200"
+	LeaseDurationSeconds int    `json:"lease_duration_seconds"`           // e.g. 120 or 7200
+	LeaseDurationSec     int    `json:"lease_duration_sec,omitempty"`     // alias for frontend compatibility
+	SubnetMask           string `json:"subnet_mask"`                      // e.g. "255.255.255.0"
 }
 
 // PXEConfig defines bootstrap protocol listener settings.

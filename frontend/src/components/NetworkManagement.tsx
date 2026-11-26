@@ -58,9 +58,10 @@ export interface NetworkProfileData {
   network_mode: string;
   selected_adapter: AdapterMatch;
   ipv4_config: {
-    server_ip: string;
+    server_ip?: string;
+    ip_address?: string;
     prefix_length: number;
-    subnet_mask: string;
+    subnet_mask?: string;
     default_gateway: string;
     dns_servers: string[];
   };
@@ -69,7 +70,9 @@ export interface NetworkProfileData {
     pool_configured: boolean;
     pool_start: string;
     pool_end: string;
-    lease_duration_sec: number;
+    lease_duration_sec?: number;
+    lease_duration_seconds?: number;
+    subnet_mask?: string;
   };
   pxe_config: {
     enable_standalone_dhcp: boolean;
@@ -180,6 +183,7 @@ export default function NetworkManagement({
   const [poolEnd, setPoolEnd] = useState('192.168.50.200');
   const [leaseDuration, setLeaseDuration] = useState(86400);
   const [networkMode, setNetworkMode] = useState('isolated_standalone');
+  const [managementRouteSecured, setManagementRouteSecured] = useState(false);
   const [uefiBootloader, setUefiBootloader] = useState('ipxe.efi');
   const [biosBootloader, setBiosBootloader] = useState('undionly.kpxe');
 
@@ -200,12 +204,13 @@ export default function NetworkManagement({
       if (resProfile.ok) {
         const p: NetworkProfileData = await resProfile.json();
         setProfile(p);
-        setServerIP(p.ipv4_config?.server_ip || '192.168.50.1');
+        setServerIP(p.ipv4_config?.server_ip || p.ipv4_config?.ip_address || '192.168.50.1');
         setPrefixLen(p.ipv4_config?.prefix_length || 24);
         setPoolStart(p.dhcp_config?.pool_start || '192.168.50.100');
         setPoolEnd(p.dhcp_config?.pool_end || '192.168.50.200');
-        setLeaseDuration(p.dhcp_config?.lease_duration_sec || 86400);
+        setLeaseDuration(p.dhcp_config?.lease_duration_sec || p.dhcp_config?.lease_duration_seconds || 86400);
         setNetworkMode(p.network_mode || 'isolated_standalone');
+        setManagementRouteSecured(p.management_route_secured ?? false);
         setUefiBootloader(p.pxe_config?.uefi_bootloader || 'ipxe.efi');
         setBiosBootloader(p.pxe_config?.bios_bootloader || 'undionly.kpxe');
       }
@@ -214,6 +219,8 @@ export default function NetworkManagement({
       }
       if (resRollbackScript.ok) {
         setRollbackScript(await resRollbackScript.text());
+      } else {
+        setRollbackScript('# No rollback script available.');
       }
     } catch (e) {
       console.error('Failed to load network data:', e);
@@ -282,18 +289,21 @@ export default function NetworkManagement({
     const updated: NetworkProfileData = {
       ...profile,
       network_mode: networkMode,
+      management_route_secured: managementRouteSecured,
       ipv4_config: {
         ...profile.ipv4_config,
         server_ip: serverIP,
+        ip_address: serverIP,
         prefix_length: Number(prefixLen),
-        default_gateway: networkMode === 'isolated_standalone' ? '' : profile.ipv4_config.default_gateway,
-        dns_servers: networkMode === 'isolated_standalone' ? [] : profile.ipv4_config.dns_servers
+        default_gateway: networkMode === 'isolated_standalone' ? '' : (profile.ipv4_config?.default_gateway || ''),
+        dns_servers: networkMode === 'isolated_standalone' ? [] : (profile.ipv4_config?.dns_servers || [])
       },
       dhcp_config: {
         ...profile.dhcp_config,
         pool_start: poolStart,
         pool_end: poolEnd,
-        lease_duration_sec: Number(leaseDuration)
+        lease_duration_sec: Number(leaseDuration),
+        lease_duration_seconds: Number(leaseDuration)
       },
       pxe_config: {
         ...profile.pxe_config,
@@ -688,7 +698,7 @@ export default function NetworkManagement({
                         <span className="text-xs font-semibold text-blue-600 dark:text-blue-400">
                           Bound
                         </span>
-                      ) : a.safety_role === 'CANDIDATE' ? (
+                      ) : (a.safety_role === 'CANDIDATE' || managementRouteSecured) ? (
                         <button
                           onClick={() => setAdoptTarget(a)}
                           className="px-2.5 py-1 text-xs font-medium rounded bg-blue-600 text-white hover:bg-blue-700 transition-colors shadow-sm"
@@ -831,6 +841,19 @@ export default function NetworkManagement({
                   theme === 'dark' ? 'bg-slate-900 border-slate-700 text-slate-200' : 'bg-white border-slate-300 text-slate-800'
                 }`}
               />
+            </div>
+
+            <div className="flex items-center gap-2 pt-2 md:col-span-2">
+              <input
+                type="checkbox"
+                id="mgmt-override"
+                checked={managementRouteSecured}
+                onChange={(e) => setManagementRouteSecured(e.target.checked)}
+                className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 h-4 w-4 cursor-pointer"
+              />
+              <label htmlFor="mgmt-override" className="text-xs text-slate-500 font-medium cursor-pointer select-none">
+                Override Internet Safety Guard (Single-NIC / Lab Testing Mode)
+              </label>
             </div>
           </div>
 

@@ -157,6 +157,18 @@ func (m *NetworkConfigManager) LoadProfile() (*NetworkProfile, error) {
 		profile.Version = 1
 	}
 
+	// Bidirectional alias sync for frontend compatibility
+	if profile.IPv4Config.ServerIP == "" && profile.IPv4Config.IPAddress != "" {
+		profile.IPv4Config.ServerIP = profile.IPv4Config.IPAddress
+	} else if profile.IPv4Config.IPAddress == "" && profile.IPv4Config.ServerIP != "" {
+		profile.IPv4Config.IPAddress = profile.IPv4Config.ServerIP
+	}
+	if profile.DHCPConfig.LeaseDurationSec == 0 && profile.DHCPConfig.LeaseDurationSeconds != 0 {
+		profile.DHCPConfig.LeaseDurationSec = profile.DHCPConfig.LeaseDurationSeconds
+	} else if profile.DHCPConfig.LeaseDurationSeconds == 0 && profile.DHCPConfig.LeaseDurationSec != 0 {
+		profile.DHCPConfig.LeaseDurationSeconds = profile.DHCPConfig.LeaseDurationSec
+	}
+
 	return &profile, nil
 }
 
@@ -166,6 +178,18 @@ func (m *NetworkConfigManager) SaveProfile(profile *NetworkProfile) error {
 	defer m.mu.Unlock()
 
 	profile.LastUpdatedAt = time.Now().UTC()
+
+	// Bidirectional alias sync for frontend compatibility
+	if profile.IPv4Config.ServerIP == "" && profile.IPv4Config.IPAddress != "" {
+		profile.IPv4Config.ServerIP = profile.IPv4Config.IPAddress
+	} else if profile.IPv4Config.IPAddress == "" && profile.IPv4Config.ServerIP != "" {
+		profile.IPv4Config.IPAddress = profile.IPv4Config.ServerIP
+	}
+	if profile.DHCPConfig.LeaseDurationSec == 0 && profile.DHCPConfig.LeaseDurationSeconds != 0 {
+		profile.DHCPConfig.LeaseDurationSec = profile.DHCPConfig.LeaseDurationSeconds
+	} else if profile.DHCPConfig.LeaseDurationSeconds == 0 && profile.DHCPConfig.LeaseDurationSec != 0 {
+		profile.DHCPConfig.LeaseDurationSeconds = profile.DHCPConfig.LeaseDurationSec
+	}
 
 	// 1. Create backup if current file exists
 	if _, err := os.Stat(m.configFile); err == nil {
@@ -825,6 +849,18 @@ func (m *NetworkConfigManager) ValidateProfile(p *NetworkProfile, adapters []Net
 		Errors:   []string{},
 	}
 
+	// Bidirectional alias sync
+	if p.IPv4Config.IPAddress == "" && p.IPv4Config.ServerIP != "" {
+		p.IPv4Config.IPAddress = p.IPv4Config.ServerIP
+	} else if p.IPv4Config.ServerIP == "" && p.IPv4Config.IPAddress != "" {
+		p.IPv4Config.ServerIP = p.IPv4Config.IPAddress
+	}
+	if p.DHCPConfig.LeaseDurationSeconds == 0 && p.DHCPConfig.LeaseDurationSec != 0 {
+		p.DHCPConfig.LeaseDurationSeconds = p.DHCPConfig.LeaseDurationSec
+	} else if p.DHCPConfig.LeaseDurationSec == 0 && p.DHCPConfig.LeaseDurationSeconds != 0 {
+		p.DHCPConfig.LeaseDurationSec = p.DHCPConfig.LeaseDurationSeconds
+	}
+
 	// 1. Validate Server IP & Prefix
 	ip := net.ParseIP(p.IPv4Config.IPAddress).To4()
 	if ip == nil {
@@ -934,9 +970,13 @@ func (m *NetworkConfigManager) ValidateProfile(p *NetworkProfile, adapters []Net
 				if a.IsWireless {
 					report.ProtectedAdapter = true
 					report.Errors = append(report.Errors, fmt.Sprintf("Safety Violation: Adapter '%s' is a wireless interface. Cannot be adopted for PXE boot.", a.InterfaceAlias))
-				} else if a.SafetyRole == RoleProtectedInternet && !p.ManagementRouteSecured {
-					report.ProtectedAdapter = true
-					report.Errors = append(report.Errors, fmt.Sprintf("Safety Violation: Adapter '%s' holds an active default gateway (%s). Transition requires a verified alternate management route.", a.InterfaceAlias, strings.Join(a.DefaultGateways, ", ")))
+				} else if a.SafetyRole == RoleProtectedInternet {
+					if !p.ManagementRouteSecured {
+						report.ProtectedAdapter = true
+						report.Errors = append(report.Errors, fmt.Sprintf("Safety Violation: Adapter '%s' holds an active default gateway (%s). Enable Management Route Override if using a single NIC or test environment.", a.InterfaceAlias, strings.Join(a.DefaultGateways, ", ")))
+					} else {
+						report.Warnings = append(report.Warnings, fmt.Sprintf("Notice: Adapter '%s' holds active default gateway (%s). Single-NIC / Lab override is enabled.", a.InterfaceAlias, strings.Join(a.DefaultGateways, ", ")))
+					}
 				}
 				if a.SafetyRole == RoleVirtualBlocked {
 					report.ProtectedAdapter = true
