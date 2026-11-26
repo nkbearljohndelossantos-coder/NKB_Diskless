@@ -200,6 +200,13 @@ export default function App() {
   // Disk Assignment Modal
   const [assignModal, setAssignModal] = useState<{ client: Client; diskId: string; mode: string } | null>(null);
 
+  // OS Image Builder State
+  const [showApplyOSModal, setShowApplyOSModal] = useState<VirtualDisk | null>(null);
+  const [installerList, setInstallerList] = useState<{ name: string; path: string; size_bytes: number; type: string }[]>([]);
+  const [selectedInstallerPath, setSelectedInstallerPath] = useState('');
+  const [wimIndex, setWimIndex] = useState(1);
+  const [isApplyingOS, setIsApplyingOS] = useState(false);
+
   // Forms State
   const [newClient, setNewClient] = useState({ mac: '', hostname: '', group_id: '', disk_id: '' });
   const [newDisk, setNewDisk] = useState({ name: '', size_gb: 50, format: 'VHDX', os_type: 'Windows 11 Pro x64', description: '' });
@@ -708,6 +715,52 @@ export default function App() {
       }
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const handleOpenApplyOS = async (disk: VirtualDisk) => {
+    setShowApplyOSModal(disk);
+    try {
+      const res = await fetch('/api/v1/installers', { credentials: 'include' });
+      if (res.ok) {
+        const data = await res.json();
+        setInstallerList(data);
+        if (data.length > 0) {
+          setSelectedInstallerPath(data[0].path);
+        }
+      }
+    } catch (e) {
+      console.error('Failed to load installers', e);
+    }
+  };
+
+  const handleExecuteApplyOS = async () => {
+    if (!showApplyOSModal || !selectedInstallerPath) return;
+    setIsApplyingOS(true);
+    showNotification(`Applying OS from ${selectedInstallerPath.split(/[\\/]/).pop()} to ${showApplyOSModal.name}...`);
+    try {
+      const res = await fetch(`/api/v1/disks/${showApplyOSModal.id}/apply-os`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          installer_path: selectedInstallerPath,
+          wim_index: wimIndex
+        })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        showNotification(data.message || 'OS image deployment started successfully!');
+        setShowApplyOSModal(null);
+        fetchDisks();
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Deployment failed' }));
+        showNotification(`Deploy Error: ${err.error || 'Failed to start OS deployment'}`);
+      }
+    } catch (err) {
+      showNotification('Network error starting OS image deployment.');
+    } finally {
+      setIsApplyingOS(false);
     }
   };
 
@@ -1599,21 +1652,31 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="mt-5 pt-3 border-t border-slate-100 dark:border-slate-700 flex justify-between items-center">
+                    <div className="mt-5 pt-3 border-t border-slate-100 dark:border-slate-700 flex justify-between items-center gap-2">
                       <button
-                        onClick={() => handleValidateDisk(d.id)}
-                        className="text-xs text-blue-600 hover:underline flex items-center gap-1"
+                        onClick={() => handleOpenApplyOS(d)}
+                        className="px-2.5 py-1 text-xs bg-emerald-600 text-white rounded hover:bg-emerald-700 flex items-center gap-1 font-semibold shadow-sm"
+                        title="Install Windows OS Image directly to this VHD from ISO/WIM"
                       >
-                        <Shield className="w-3.5 h-3.5" />
-                        <span>Verify Hash</span>
+                        <DownloadCloud className="w-3.5 h-3.5" />
+                        <span>Build / Flash OS</span>
                       </button>
-                      <button
-                        onClick={() => handleDuplicateDisk(d.id, d.name)}
-                        className="text-xs text-slate-600 dark:text-slate-400 hover:text-blue-600 flex items-center gap-1"
-                      >
-                        <Copy className="w-3.5 h-3.5" />
-                        <span>Clone</span>
-                      </button>
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={() => handleValidateDisk(d.id)}
+                          className="text-xs text-blue-600 hover:underline flex items-center gap-1"
+                        >
+                          <Shield className="w-3.5 h-3.5" />
+                          <span>Verify</span>
+                        </button>
+                        <button
+                          onClick={() => handleDuplicateDisk(d.id, d.name)}
+                          className="text-xs text-slate-600 dark:text-slate-400 hover:text-blue-600 flex items-center gap-1"
+                        >
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Clone</span>
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -2366,6 +2429,98 @@ reboot`}
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: APPLY OS IMAGE TO VIRTUAL DISK */}
+      {showApplyOSModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+          <div className={`w-full max-w-lg p-6 rounded-lg shadow-xl ${theme === 'dark' ? 'bg-slate-800 text-white' : 'bg-white text-slate-900'}`}>
+            <div className="flex items-center justify-between mb-3 border-b dark:border-slate-700 pb-3">
+              <div className="flex items-center gap-2">
+                <DownloadCloud className="w-5 h-5 text-emerald-500" />
+                <h3 className="font-bold text-sm">Deploy OS Image to Virtual Disk</h3>
+              </div>
+              <button onClick={() => setShowApplyOSModal(null)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-4 text-xs">
+              <div className="p-3 rounded bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-900">
+                <div className="flex justify-between items-center text-blue-900 dark:text-blue-300">
+                  <span className="font-semibold">Target Virtual Disk:</span>
+                  <span className="font-bold font-mono text-sm">{showApplyOSModal.name}</span>
+                </div>
+                <div className="flex justify-between items-center text-blue-700 dark:text-blue-400 mt-1">
+                  <span>Capacity: {formatBytes(showApplyOSModal.size_bytes)}</span>
+                  <span className="truncate max-w-[200px] text-[10px] font-mono">{showApplyOSModal.file_path}</span>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-500 mb-1 font-semibold">Select Source Installer (ISO / WIM) *</label>
+                {installerList.length > 0 ? (
+                  <select
+                    value={selectedInstallerPath}
+                    onChange={e => setSelectedInstallerPath(e.target.value)}
+                    className="w-full p-2.5 border rounded focus:outline-none dark:bg-slate-700 dark:border-slate-600 font-mono text-xs"
+                  >
+                    {installerList.map((inst, idx) => (
+                      <option key={idx} value={inst.path}>
+                        {inst.name} ({formatBytes(inst.size_bytes)}) [{inst.type.toUpperCase()}]
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="p-3 border rounded text-amber-600 bg-amber-50 dark:bg-amber-950/30 text-xs">
+                    No installer files (.iso/.wim) found in C:\NKB-PoC\installers. Please place Windows ISOs in C:\NKB-PoC\installers\iso\.
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-slate-500 mb-1 font-semibold">Target WIM Edition Index</label>
+                <select
+                  value={wimIndex}
+                  onChange={e => setWimIndex(parseInt(e.target.value) || 1)}
+                  className="w-full p-2 border rounded focus:outline-none dark:bg-slate-700 dark:border-slate-600 text-xs"
+                >
+                  <option value={1}>Index 1 - Windows 11 Pro / Master Image (Default)</option>
+                  <option value={2}>Index 2 - Windows 11 Enterprise</option>
+                  <option value={3}>Index 3 - Windows 11 Home</option>
+                </select>
+              </div>
+
+              <div className="p-3 rounded bg-slate-50 dark:bg-slate-900 border text-slate-500 text-[11px] leading-relaxed">
+                <span className="font-semibold text-slate-700 dark:text-slate-300">⚡ Automated Fast Deployment:</span>
+                <p className="mt-1">
+                  The server mounts the ISO, formats the VHD with GPT + UEFI partitions, applies the Windows image directly using DISM, and writes the UEFI bootloader.
+                  Workstations will boot directly to the Windows Desktop without requiring manual setup on the client!
+                </p>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t dark:border-slate-700">
+                <button
+                  type="button"
+                  disabled={isApplyingOS}
+                  onClick={() => setShowApplyOSModal(null)}
+                  className="px-4 py-2 border rounded text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={isApplyingOS || installerList.length === 0}
+                  onClick={handleExecuteApplyOS}
+                  className="px-4 py-2 bg-emerald-600 text-white rounded font-medium hover:bg-emerald-700 flex items-center gap-1.5 shadow"
+                >
+                  <DownloadCloud className="w-4 h-4" />
+                  <span>{isApplyingOS ? 'Deploying...' : 'Build & Flash OS to VHD'}</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

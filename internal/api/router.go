@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -174,6 +175,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/disks/{id}/versions", s.auth.RequireAuth(s.handleListDiskVersions))
 	s.mux.HandleFunc("POST /api/v1/disks/{id}/rollback", s.auth.RequireRole("admin")(s.handleRollbackDisk))
 	s.mux.HandleFunc("POST /api/v1/disks/{id}/validate", s.auth.RequireRole("admin")(s.handleValidateDisk))
+	s.mux.HandleFunc("GET /api/v1/installers", s.auth.RequireAuth(s.handleListInstallers))
+	s.mux.HandleFunc("POST /api/v1/disks/{id}/apply-os", s.auth.RequireRole("admin")(s.handleApplyOSImage))
 	s.mux.HandleFunc("POST /api/v1/super-client/commit", s.auth.RequireRole("admin")(s.handleCommitSuperClient))
 
 	// 6. Client Groups
@@ -951,6 +954,91 @@ func (s *Server) handleDuplicateDisk(w http.ResponseWriter, r *http.Request) {
 
 	_ = s.db.RecordAudit(nil, "admin", "DISK_CLONE", "disk", newDisk.ID, fmt.Sprintf("Cloned disk to %s", newDisk.Name), r.RemoteAddr)
 	s.jsonResponse(w, http.StatusCreated, newDisk)
+}
+
+func (s *Server) handleListInstallers(w http.ResponseWriter, r *http.Request) {
+	baseDir := filepath.Join(s.cfg.StorageRoot, "installers")
+	if _, err := os.Stat(baseDir); os.IsNotExist(err) {
+		baseDir = `C:\NKB-PoC\installers`
+	}
+	type InstallerItem struct {
+		Name      string `json:"name"`
+		Path      string `json:"path"`
+		SizeBytes int64  `json:"size_bytes"`
+		Type      string `json:"type"`
+	}
+	var items []InstallerItem
+	_ = filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext == ".iso" || ext == ".wim" || ext == ".esd" {
+			items = append(items, InstallerItem{
+				Name:      info.Name(),
+				Path:      path,
+				SizeBytes: info.Size(),
+				Type:      strings.TrimPrefix(ext, "."),
+			})
+		}
+		return nil
+	})
+	if items == nil {
+		items = []InstallerItem{}
+	}
+	s.jsonResponse(w, http.StatusOK, items)
+}
+
+func (s *Server) handleApplyOSImage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	disk, err := s.db.GetDiskByID(id)
+	if err != nil || disk == nil {
+		s.errorResponse(w, http.StatusNotFound, "virtual disk not found")
+		return
+	}
+
+	var payload struct {
+		InstallerPath string `json:"installer_path"`
+		WimIndex      int    `json:"wim_index"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&payload)
+	if payload.InstallerPath == "" {
+		payload.InstallerPath = `C:\NKB-PoC\installers\iso\Windows 11 Pro.ISO`
+	}
+	if payload.WimIndex <= 0 {
+		payload.WimIndex = 1
+	}
+
+	scriptPath := filepath.Join(s.cfg.StorageRoot, "bin", "deploy-os-vhd.ps1")
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		scriptPath = `C:\NKB-PoC\bin\deploy-os-vhd.ps1`
+	}
+
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+		"-VhdPath", disk.FilePath,
+		"-IsoPath", payload.InstallerPath,
+		"-WimIndex", fmt.Sprintf("%d", payload.WimIndex),
+	)
+
+	go func() {
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			slog.Error("OS Image deployment failed", "disk", disk.Name, "err", err, "out", string(out))
+			return
+		}
+		slog.Info("OS Image deployment completed successfully", "disk", disk.Name)
+		iscsiExe := filepath.Join(s.cfg.StorageRoot, "bin", "nkb-iscsi.exe")
+		if _, err := os.Stat(iscsiExe); os.IsNotExist(err) {
+			iscsiExe = `C:\NKB-PoC\bin\nkb-iscsi.exe`
+		}
+		_ = exec.Command(iscsiExe, "-vhd", disk.FilePath, "-port", "3260", "-size", "100").Start()
+	}()
+
+	_ = s.db.RecordAudit(nil, "admin", "DISK_APPLY_OS", "disk", disk.ID, fmt.Sprintf("Started OS deployment from %s to %s", payload.InstallerPath, disk.Name), r.RemoteAddr)
+	s.jsonResponse(w, http.StatusAccepted, map[string]string{
+		"status":  "deploying",
+		"message": fmt.Sprintf("OS image deployment from %s started. This will take 2-4 minutes in the background.", filepath.Base(payload.InstallerPath)),
+	})
 }
 
 func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
