@@ -3,12 +3,14 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -956,33 +958,163 @@ func (s *Server) handleDuplicateDisk(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, http.StatusCreated, newDisk)
 }
 
-func (s *Server) handleListInstallers(w http.ResponseWriter, r *http.Request) {
-	baseDir := filepath.Join(s.cfg.StorageRoot, "installers")
-	if _, err := os.Stat(baseDir); os.IsNotExist(err) {
-		baseDir = `C:\NKB-PoC\installers`
-	}
-	type InstallerItem struct {
-		Name      string `json:"name"`
-		Path      string `json:"path"`
-		SizeBytes int64  `json:"size_bytes"`
-		Type      string `json:"type"`
-	}
-	var items []InstallerItem
-	_ = filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext == ".iso" || ext == ".wim" || ext == ".esd" {
-			items = append(items, InstallerItem{
-				Name:      info.Name(),
-				Path:      path,
-				SizeBytes: info.Size(),
-				Type:      strings.TrimPrefix(ext, "."),
-			})
-		}
+type WimEdition struct {
+	Index       int    `json:"index"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+func parseWimEditions(wimPath string) []WimEdition {
+	f, err := os.Open(wimPath)
+	if err != nil {
 		return nil
-	})
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+
+	offset := int64(0)
+	readSize := int64(4 * 1024 * 1024)
+	if fi.Size() > readSize {
+		offset = fi.Size() - readSize
+	} else {
+		readSize = fi.Size()
+	}
+
+	buf := make([]byte, readSize)
+	_, err = f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil
+	}
+
+	var sb strings.Builder
+	for i := 0; i < len(buf)-1; i += 2 {
+		if buf[i+1] == 0 && buf[i] >= 32 && buf[i] <= 126 {
+			sb.WriteByte(buf[i])
+		} else if buf[i] == '\n' || buf[i] == '\r' || buf[i] == '\t' {
+			sb.WriteByte(buf[i])
+		}
+	}
+	ascii := sb.String()
+
+	reImage := regexp.MustCompile(`(?s)<IMAGE INDEX="(\d+)">(.*?)</IMAGE>`)
+	reName := regexp.MustCompile(`<NAME>(.*?)</NAME>`)
+	reDesc := regexp.MustCompile(`<DESCRIPTION>(.*?)</DESCRIPTION>`)
+
+	matches := reImage.FindAllStringSubmatch(ascii, -1)
+	var editions []WimEdition
+	for _, m := range matches {
+		idx, _ := strconv.Atoi(m[1])
+		name := fmt.Sprintf("Edition %d", idx)
+		desc := ""
+		if nm := reName.FindStringSubmatch(m[2]); len(nm) > 1 {
+			name = nm[1]
+		}
+		if dm := reDesc.FindStringSubmatch(m[2]); len(dm) > 1 {
+			desc = dm[1]
+		}
+		editions = append(editions, WimEdition{
+			Index:       idx,
+			Name:        name,
+			Description: desc,
+		})
+	}
+	return editions
+}
+
+func inspectInstallerEditions(installerPath string) []WimEdition {
+	ext := strings.ToLower(filepath.Ext(installerPath))
+	if ext == ".wim" || ext == ".esd" {
+		if ed := parseWimEditions(installerPath); len(ed) > 0 {
+			return ed
+		}
+	}
+
+	if ext == ".iso" {
+		// 1. Check if ISO is already mounted on a Windows drive letter
+		for _, drive := range []string{"D", "E", "F", "G", "H", "I"} {
+			testWim := fmt.Sprintf("%s:\\sources\\install.wim", drive)
+			if _, err := os.Stat(testWim); err == nil {
+				if ed := parseWimEditions(testWim); len(ed) > 0 {
+					return ed
+				}
+			}
+			testEsd := fmt.Sprintf("%s:\\sources\\install.esd", drive)
+			if _, err := os.Stat(testEsd); err == nil {
+				if ed := parseWimEditions(testEsd); len(ed) > 0 {
+					return ed
+				}
+			}
+		}
+
+		// 2. Try mounting via PowerShell
+		out, err := exec.Command("powershell", "-NoProfile", "-Command",
+			fmt.Sprintf("Mount-DiskImage -ImagePath '%s' -PassThru | Out-Null; (Get-DiskImage -ImagePath '%s' | Get-Volume).DriveLetter", installerPath, installerPath)).Output()
+		if err == nil {
+			dl := strings.TrimSpace(string(out))
+			if dl != "" {
+				testWim := fmt.Sprintf("%s:\\sources\\install.wim", dl)
+				if ed := parseWimEditions(testWim); len(ed) > 0 {
+					return ed
+				}
+			}
+		}
+	}
+
+	return []WimEdition{
+		{Index: 1, Name: "Windows 11 Pro / Master Image (Auto-Detected)", Description: "Default Installation Image"},
+	}
+}
+
+func (s *Server) handleListInstallers(w http.ResponseWriter, r *http.Request) {
+	candidateDirs := []string{
+		`C:\NKB-PoC\installers`,
+		filepath.Join(s.cfg.StorageRoot, "installers"),
+		"/var/nkb-diskless/installers",
+		"installers",
+	}
+
+	type InstallerItem struct {
+		Name      string       `json:"name"`
+		Path      string       `json:"path"`
+		SizeBytes int64        `json:"size_bytes"`
+		Type      string       `json:"type"`
+		Editions  []WimEdition `json:"editions"`
+	}
+
+	seenPaths := make(map[string]bool)
+	var items []InstallerItem
+
+	for _, baseDir := range candidateDirs {
+		if _, err := os.Stat(baseDir); err != nil {
+			continue
+		}
+		_ = filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".iso" || ext == ".wim" || ext == ".esd" {
+				normPath := filepath.Clean(path)
+				if !seenPaths[normPath] {
+					seenPaths[normPath] = true
+					editions := inspectInstallerEditions(normPath)
+					items = append(items, InstallerItem{
+						Name:      info.Name(),
+						Path:      normPath,
+						SizeBytes: info.Size(),
+						Type:      strings.TrimPrefix(ext, "."),
+						Editions:  editions,
+					})
+				}
+			}
+			return nil
+		})
+	}
+
 	if items == nil {
 		items = []InstallerItem{}
 	}

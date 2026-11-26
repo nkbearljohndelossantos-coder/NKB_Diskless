@@ -202,8 +202,9 @@ export default function App() {
 
   // OS Image Builder State
   const [showApplyOSModal, setShowApplyOSModal] = useState<VirtualDisk | null>(null);
-  const [installerList, setInstallerList] = useState<{ name: string; path: string; size_bytes: number; type: string }[]>([]);
+  const [installerList, setInstallerList] = useState<{ name: string; path: string; size_bytes: number; type: string; editions?: { index: number; name: string; description: string }[] }[]>([]);
   const [selectedInstallerPath, setSelectedInstallerPath] = useState('');
+  const [availableEditions, setAvailableEditions] = useState<{ index: number; name: string; description: string }[]>([]);
   const [wimIndex, setWimIndex] = useState(1);
   const [isApplyingOS, setIsApplyingOS] = useState(false);
 
@@ -727,10 +728,31 @@ export default function App() {
         setInstallerList(data);
         if (data.length > 0) {
           setSelectedInstallerPath(data[0].path);
+          if (data[0].editions && data[0].editions.length > 0) {
+            setAvailableEditions(data[0].editions);
+            setWimIndex(data[0].editions[0].index);
+          } else {
+            setAvailableEditions([{ index: 1, name: 'Default OS Image Index 1', description: '' }]);
+            setWimIndex(1);
+          }
+        } else {
+          setAvailableEditions([]);
         }
       }
     } catch (e) {
       console.error('Failed to load installers', e);
+    }
+  };
+
+  const handleSelectInstaller = (path: string) => {
+    setSelectedInstallerPath(path);
+    const found = installerList.find(i => i.path === path);
+    if (found && found.editions && found.editions.length > 0) {
+      setAvailableEditions(found.editions);
+      setWimIndex(found.editions[0].index);
+    } else {
+      setAvailableEditions([{ index: 1, name: 'Default OS Image Index 1', description: '' }]);
+      setWimIndex(1);
     }
   };
 
@@ -2460,11 +2482,16 @@ reboot`}
               </div>
 
               <div>
-                <label className="block text-slate-500 mb-1 font-semibold">Select Source Installer (ISO / WIM) *</label>
+                <div className="flex justify-between items-center mb-1">
+                  <label className="text-slate-500 font-semibold">Select Source Installer</label>
+                  <span className="text-[11px] px-2 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 font-medium font-mono">
+                    {installerList.length} installer{installerList.length !== 1 ? 's' : ''} auto-detected
+                  </span>
+                </div>
                 {installerList.length > 0 ? (
                   <select
                     value={selectedInstallerPath}
-                    onChange={e => setSelectedInstallerPath(e.target.value)}
+                    onChange={e => handleSelectInstaller(e.target.value)}
                     className="w-full p-2.5 border rounded focus:outline-none dark:bg-slate-700 dark:border-slate-600 font-mono text-xs"
                   >
                     {installerList.map((inst, idx) => (
@@ -2474,22 +2501,35 @@ reboot`}
                     ))}
                   </select>
                 ) : (
-                  <div className="p-3 border rounded text-amber-600 bg-amber-50 dark:bg-amber-950/30 text-xs">
-                    No installer files (.iso/.wim) found in C:\NKB-PoC\installers. Please place Windows ISOs in C:\NKB-PoC\installers\iso\.
+                  <div className="p-3 border rounded text-amber-600 bg-amber-50 dark:bg-amber-950/30 text-xs space-y-1">
+                    <p className="font-semibold">No installer files (.iso/.wim) found in C:\NKB-PoC\installers.</p>
+                    <p className="text-[11px] text-slate-500 leading-normal">
+                      Note: If accessing via the Cloud VPS, open the Local Server Dashboard at <span className="font-mono font-bold text-blue-600">http://192.168.254.100:8443</span> (or http://localhost:8443) where the physical installers folder is located.
+                    </p>
                   </div>
                 )}
               </div>
 
               <div>
-                <label className="block text-slate-500 mb-1 font-semibold">Target WIM Edition Index</label>
+                <div className="flex justify-between items-center mb-1">
+                  <label className="text-slate-500 font-semibold">Target WIM Edition</label>
+                  <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium">
+                    ✓ Auto-Detected ({availableEditions.length} available)
+                  </span>
+                </div>
                 <select
                   value={wimIndex}
                   onChange={e => setWimIndex(parseInt(e.target.value) || 1)}
-                  className="w-full p-2 border rounded focus:outline-none dark:bg-slate-700 dark:border-slate-600 text-xs"
+                  className="w-full p-2.5 border rounded focus:outline-none dark:bg-slate-700 dark:border-slate-600 text-xs font-medium"
                 >
-                  <option value={1}>Index 1 - Windows 11 Pro / Master Image (Default)</option>
-                  <option value={2}>Index 2 - Windows 11 Enterprise</option>
-                  <option value={3}>Index 3 - Windows 11 Home</option>
+                  {availableEditions.map(ed => (
+                    <option key={ed.index} value={ed.index}>
+                      Index {ed.index} - {ed.name} {ed.description && ed.description !== ed.name ? `(${ed.description})` : ''}
+                    </option>
+                  ))}
+                  {availableEditions.length === 0 && (
+                    <option value={1}>Index 1 - Windows 11 Pro / Master Image (Default)</option>
+                  )}
                 </select>
               </div>
 
