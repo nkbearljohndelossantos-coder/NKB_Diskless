@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Threading;
 using DiskAccessLibrary;
+using DiskAccessLibrary.Win32;
 using ISCSI.Server;
 using ISCSI.Logging;
 
@@ -11,7 +12,7 @@ namespace NKBDiskless.Daemon
 {
     class Program
     {
-        static string logFile = "iscsi_server.log";
+        static string logFile = @"C:\NKB-PoC\iscsi_server.log";
 
         static void Log(string msg)
         {
@@ -28,54 +29,111 @@ namespace NKBDiskless.Daemon
 
             string targetName = "iqn.2026-11.com.nkb:client-2800afa844cc";
             string vhdPath = @"C:\NKB-PoC\disks\virtual\prod_2.vhd";
+            int diskNumber = -1;
             int port = 3260;
 
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "-target" && i + 1 < args.Length) targetName = args[++i];
                 if (args[i] == "-vhd" && i + 1 < args.Length) vhdPath = args[++i];
+                if (args[i] == "-disk" && i + 1 < args.Length) int.TryParse(args[++i], out diskNumber);
                 if (args[i] == "-port" && i + 1 < args.Length) int.TryParse(args[++i], out port);
             }
 
-            Log(" Target IQN : " + targetName);
-            Log(" VHD Image  : " + vhdPath);
-            Log(" Port       : " + port);
+            Log(" Target IQN  : " + targetName);
+            Log(" VHD Path    : " + vhdPath);
+            Log(" Disk Number : " + (diskNumber >= 0 ? diskNumber.ToString() : "N/A"));
+            Log(" Port        : " + port);
             Log("=================================================================");
 
-            if (!File.Exists(vhdPath))
-            {
-                Log("[X] FATAL: VHD file not found: " + vhdPath);
-                return;
-            }
-
             Disk disk = null;
-            try
+
+            if (diskNumber >= 0)
             {
-                Log("[*] Opening Virtual Hard Disk (Read/Write)...");
-                disk = new VirtualHardDisk(vhdPath, false);
-                Log("[✓] VHD opened (Read/Write). Size: " + (disk.Size / (1024 * 1024 * 1024)) + " GB");
-            }
-            catch (Exception ex)
-            {
-                Log("[!] Read/Write failed: " + ex.Message + ". Attempting Read-Only...");
                 try
                 {
-                    disk = new VirtualHardDisk(vhdPath, true);
-                    Log("[✓] VHD opened (Read-Only). Size: " + (disk.Size / (1024 * 1024 * 1024)) + " GB");
+                    Log(string.Format("[*] Opening PhysicalDisk {0} (Read/Write)...", diskNumber));
+                    disk = new PhysicalDisk(diskNumber, false);
+                    Log(string.Format("[✓] PhysicalDisk {0} opened. Size: {1} GB", diskNumber, disk.Size / (1024 * 1024 * 1024)));
                 }
-                catch (Exception ex2)
+                catch (Exception ex)
                 {
-                    Log("[X] FATAL: Could not open VHD: " + ex2.ToString());
+                    Log(string.Format("[!] PhysicalDisk {0} failed: {1}. Falling back to VHD...", diskNumber, ex.Message));
+                    disk = null;
+                }
+            }
+
+            if (disk == null)
+            {
+                if (!File.Exists(vhdPath))
+                {
+                    try
+                    {
+                        string dir = Path.GetDirectoryName(vhdPath);
+                        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                        {
+                            Directory.CreateDirectory(dir);
+                        }
+                        Log("[*] VHD not found. Auto-creating 60 GB Dynamic VHD: " + vhdPath);
+                        long sizeBytes = 60L * 1024 * 1024 * 1024;
+                        VirtualHardDisk.CreateDynamicDisk(vhdPath, sizeBytes);
+                        Log("[✓] 60 GB Dynamic VHD successfully created.");
+                    }
+                    catch (Exception exCreate)
+                    {
+                        Log("[X] Failed to auto-create VHD: " + exCreate.Message);
+                    }
+                }
+
+                if (!File.Exists(vhdPath))
+                {
+                    Log("[X] FATAL: VHD file not found: " + vhdPath);
                     return;
+                }
+
+                try
+                {
+                    Log("[*] Opening Virtual Hard Disk (Read/Write)...");
+                    disk = new VirtualHardDisk(vhdPath, false);
+                    Log("[✓] VHD opened (Read/Write). Size: " + (disk.Size / (1024 * 1024 * 1024)) + " GB");
+                }
+                catch (Exception ex)
+                {
+                    Log("[!] Read/Write failed: " + ex.Message + ". Attempting Read-Only...");
+                    try
+                    {
+                        disk = new VirtualHardDisk(vhdPath, true);
+                        Log("[✓] VHD opened (Read-Only). Size: " + (disk.Size / (1024 * 1024 * 1024)) + " GB");
+                    }
+                    catch (Exception ex2)
+                    {
+                        Log("[X] FATAL: Could not open VHD: " + ex2.ToString());
+                        return;
+                    }
                 }
             }
 
             List<Disk> diskList = new List<Disk>();
             diskList.Add(disk);
 
-            ISCSI.Server.ISCSITarget target = new ISCSI.Server.ISCSITarget(targetName, diskList);
             ISCSIServer server = new ISCSIServer();
-            server.AddTarget(target);
+            server.AddTarget(new ISCSI.Server.ISCSITarget(targetName, diskList));
+
+            // Also register common aliases so any client connection succeeds
+            string[] commonAliases = new string[] {
+                "iqn.2026-11.com.nkb:client-2800afa844cc",
+                "iqn.2026-11.com.nkb:client-0492264bd5eb",
+                "iqn.2026-11.com.nkb:default",
+                "iqn.2026-11.com.nkb:master"
+            };
+
+            foreach (string alias in commonAliases)
+            {
+                if (!alias.Equals(targetName, StringComparison.OrdinalIgnoreCase))
+                {
+                    try { server.AddTarget(new ISCSI.Server.ISCSITarget(alias, diskList)); } catch { }
+                }
+            }
 
             server.OnLogEntry += (sender, log) =>
             {
@@ -87,7 +145,7 @@ namespace NKBDiskless.Daemon
             {
                 server.Start(ep);
                 Log("[✓] iSCSI Target Server is ACTIVE on 0.0.0.0:" + port);
-                Log(">>> READY for Dell Client (28:00:AF:A8:44:CC) to boot via SANBOOT.");
+                Log(">>> READY for Diskless Clients (e.g. 28:00:AF:A8:44:CC) to boot or install via SANBOOT / SANHOOK.");
                 Log("=================================================================");
             }
             catch (Exception ex)

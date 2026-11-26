@@ -181,6 +181,7 @@ echo Attaching Virtual Disk SAN target for Windows installation...
 sanhook iscsi:%s::::%s || goto san_fail
 echo Loading Windows 11 Network Installer via wimboot...
 kernel http://%s:8080/wimboot
+initrd -n startnet.cmd http://%s:8080/winpe/startnet.cmd startnet.cmd
 initrd http://%s:8080/winpe/bootmgr bootmgr
 initrd http://%s:8080/winpe/boot/bcd BCD
 initrd http://%s:8080/winpe/boot/boot.sdi boot.sdi
@@ -201,7 +202,7 @@ reboot
 		targetMode,
 		req.ServerIP, targetIQN,
 		req.ServerIP, targetIQN,
-		req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP,
+		req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP,
 		targetIQN)
 }
 
@@ -261,6 +262,7 @@ echo Attaching writable snapshot SAN target for installation...
 sanhook iscsi:%s::::%s || goto super_fail
 echo Loading Windows 11 Network Installer via wimboot...
 kernel http://%s:8080/wimboot
+initrd -n startnet.cmd http://%s:8080/winpe/startnet.cmd startnet.cmd
 initrd http://%s:8080/winpe/bootmgr bootmgr
 initrd http://%s:8080/winpe/boot/bcd BCD
 initrd http://%s:8080/winpe/boot/boot.sdi boot.sdi
@@ -281,7 +283,7 @@ reboot
 		req.ServerIP, targetIQN,
 		req.ServerIP, targetIQN,
 		req.ServerIP, targetIQN,
-		req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP,
+		req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP, req.ServerIP,
 		targetIQN)
 }
 
