@@ -817,13 +817,13 @@ export default function App() {
     return (
       <div className={`min-h-screen flex items-center justify-center p-4 font-sans ${theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'bg-slate-100 text-slate-900'}`}>
         <div className={`w-full max-w-md p-8 rounded-xl border shadow-2xl ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <div className="flex items-center justify-between mb-6">
-            <div className="flex items-center">
-              <img src="/nkb-logo.png" alt="NKB Manufacturing Corp" className="h-12 w-auto object-contain drop-shadow-md" />
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex-1 flex justify-center">
+              <img src="/nkb-logo.png" alt="NKB Diskless Enterprise Platform" className="h-28 w-auto max-w-[280px] object-contain drop-shadow-xl" />
             </div>
             <button
               onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-              className="text-slate-400 hover:text-white p-1 rounded"
+              className="text-slate-400 hover:text-white p-1 rounded shrink-0 self-start"
               title="Toggle Theme"
             >
               {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
@@ -902,13 +902,13 @@ export default function App() {
       <aside className="w-64 bg-[#0B132B] flex flex-col justify-between shrink-0 select-none border-r border-slate-800">
         <div className="overflow-y-auto">
           {/* Brand Header */}
-          <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-            <div className="flex items-center">
-              <img src="/nkb-logo.png" alt="NKB Manufacturing Corp" className="h-10 w-auto object-contain drop-shadow" />
+          <div className="p-3 border-b border-slate-800 flex items-center justify-between gap-2">
+            <div className="flex-1 flex items-center justify-center py-1">
+              <img src="/nkb-logo.png" alt="NKB Diskless Enterprise Platform" className="h-16 w-auto max-w-[190px] object-contain drop-shadow-lg" />
             </div>
             <button
               onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-              className="text-slate-400 hover:text-white p-1 rounded"
+              className="text-slate-400 hover:text-white p-1 rounded shrink-0 self-start"
               title="Toggle Theme"
             >
               {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
